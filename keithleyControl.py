@@ -929,7 +929,7 @@ class MeasurementApp(QMainWindow):
 
 
 def main():
-    qc.Config.logging["console"]["format"] = "%(asctime)s - %(message)s"
+    # qc.Config.logging["console"]["format"] = "%(asctime)s - %(message)s"
     app = QApplication(sys.argv)
     win = MeasurementApp()
     win.show()
