@@ -27,7 +27,7 @@ jobs:
 
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller --onefile main.py
+          pyinstaller --onefile keithleyControl.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
