@@ -27,7 +27,7 @@ jobs:
 
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller -i res/icons/AppIcon.png --onefile keithleyControl.py
+          pyinstaller -i res/icons/AppIcon.png --windowed --onefile keithleyControl.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
