@@ -1,3 +1,4 @@
+
 name: Build Windows EXE
 
 on:
@@ -22,28 +23,17 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller qcodes
-
-      - name: Locate QCoDeS configuration folder
-        id: qcodes-config
-        shell: pwsh
-        run: |
-          $cfg = python - << 'EOF'
-import qcodes, os
-print(os.path.join(os.path.dirname(qcodes.__file__), 'configuration'))
-EOF
-          Write-Host "Found QCoDeS config at: $cfg"
-          "QCONFIG=$cfg" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+          pip install -r requirements.txt pyinstaller
 
       - name: Build executable with PyInstaller
-        shell: pwsh
         run: |
           pyinstaller `
             -i res/icons/AppIcon.png `
             --windowed `
             --onefile `
-            --add-data "$Env:QCONFIG;qcodes/configuration" `
+            --additional-hooks-dir .github/pyinstaller-hooks `
             keithleyControl.py
+        shell: pwsh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
