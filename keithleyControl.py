@@ -148,55 +148,51 @@ class MeasurementApp(QMainWindow):
     def create_menus(self):
         menubar = self.menuBar()
 
-        # File Menu: Save/Load Config, Output Folder, Auto Output
+        # File Menu
         file_menu = menubar.addMenu("File")
-
-        save_config_action = QAction("Save Config", self)
-        save_config_action.triggered.connect(self.save_config)
-        file_menu.addAction(save_config_action)
-
-        load_config_action = QAction("Load Config", self)
-        load_config_action.triggered.connect(self.load_config)
-        file_menu.addAction(load_config_action)
-
-        select_output_action = QAction("Select Output Folder", self)
-        select_output_action.triggered.connect(self.select_output_folder)
-        file_menu.addAction(select_output_action)
-
-        self.auto_output_action = QAction("Automatic Output", self, checkable=True)
-        self.auto_output_action.triggered.connect(
-            lambda checked: self.toggle_auto_output(checked)
+        save_config_action = QAction("Save Config", self, triggered=self.save_config)
+        load_config_action = QAction("Load Config", self, triggered=self.load_config)
+        select_output_action = QAction(
+            "Select Output Folder", self, triggered=self.select_output_folder
         )
-        file_menu.addAction(self.auto_output_action)
+        self.auto_output_action = QAction(
+            "Automatic Output",
+            self,
+            checkable=True,
+            triggered=lambda c: self.toggle_auto_output(c),
+        )
+        file_menu.addActions(
+            [
+                save_config_action,
+                load_config_action,
+                select_output_action,
+                self.auto_output_action,
+            ]
+        )
 
-        # Run Menu: Back-to-Back Run
+        # Run Menu
         run_menu = menubar.addMenu("Run")
-        back_to_back_action = QAction("Run JV & JT Back-to-Back", self)
-        back_to_back_action.triggered.connect(self.run_back_to_back)
-        run_menu.addAction(back_to_back_action)
+        self.back_to_back_action = QAction(
+            "Run JV & JT Back‑to‑Back", self, triggered=self.run_back_to_back
+        )
+        run_menu.addAction(self.back_to_back_action)
 
-        # Export Menu: JV and JT exports
+        # Export Menu
         export_menu = menubar.addMenu("Export")
-        export_jv_csv_action = QAction("Export JV CSV", self)
-        export_jv_csv_action.triggered.connect(self.export_jv_csv)
-        export_menu.addAction(export_jv_csv_action)
+        export_menu.addActions(
+            [
+                QAction("Export JV CSV", self, triggered=self.export_jv_csv),
+                QAction("Export JV Plot", self, triggered=self.export_jv_plot),
+                QAction("Export JT CSV", self, triggered=self.export_jt_csv),
+                QAction("Export JT Plot", self, triggered=self.export_jt_plot),
+            ]
+        )
 
-        export_jv_plot_action = QAction("Export JV Plot", self)
-        export_jv_plot_action.triggered.connect(self.export_jv_plot)
-        export_menu.addAction(export_jv_plot_action)
-
-        export_jt_csv_action = QAction("Export JT CSV", self)
-        export_jt_csv_action.triggered.connect(self.export_jt_csv)
-        export_menu.addAction(export_jt_csv_action)
-
-        export_jt_plot_action = QAction("Export JT Plot", self)
-        export_jt_plot_action.triggered.connect(self.export_jt_plot)
-        export_menu.addAction(export_jt_plot_action)
-
-        # Appearance Menu: Dark Mode toggle
+        # Appearance Menu
         appearance_menu = menubar.addMenu("Appearance")
-        self.dark_mode_action = QAction("Dark Mode", self, checkable=True)
-        self.dark_mode_action.triggered.connect(self.toggle_dark_mode)
+        self.dark_mode_action = QAction(
+            "Dark Mode", self, checkable=True, triggered=self.toggle_dark_mode
+        )
         appearance_menu.addAction(self.dark_mode_action)
 
     def select_output_folder(self):
@@ -308,153 +304,181 @@ class MeasurementApp(QMainWindow):
         btn_layout.addWidget(self.jv_start_btn)
         self.jv_stop_btn = QPushButton("Stop JV")
         self.jv_stop_btn.clicked.connect(self.stop_jv_measurement)
+        self.jv_stop_btn.setEnabled(False)
+        self.jt_stop_btn.setEnabled(False)
         btn_layout.addWidget(self.jv_stop_btn)
         layout.addLayout(btn_layout)
 
         self.control_tabs.addTab(self.jv_tab, "JV Sweep")
+        self.elapsed_time_label = QtWidgets.QLabel("Elapsed Time: 0.0 s")
+        self.statusBar().addPermanentWidget(self.elapsed_time_label)
 
     def toggle_cycle_input(self, state):
         self.jv_cycle_input.setEnabled(state == QtCore.Qt.Checked)
 
+    # --- start_jv_sweep (replace the whole method) ------------------------------
     def start_jv_sweep(self):
         if self.smu is None:
             QMessageBox.warning(
                 self, "Instrument Error", "Please connect to the instrument first."
             )
             return
+        #  --- validate parameters (same as before) ---
         try:
             start_v = float(self.jv_start_voltage.text())
             stop_v = float(self.jv_stop_voltage.text())
-            step_size = float(self.jv_step_size.text())
-            sweep_speed = float(self.jv_speed.text())
-            if sweep_speed <= 0 or step_size <= 0:
+            step = float(self.jv_step_size.text())
+            speed = float(self.jv_speed.text())
+            if speed <= 0 or step <= 0:
                 raise ValueError("Step size and sweep speed must be positive.")
         except ValueError as e:
             QMessageBox.warning(self, "Parameter Error", f"Invalid JV parameter: {e}")
             return
 
-        # Determine sweep mode and compute setpoints using step size
+        # Disable “run” controls, enable Stop
+        self.jv_start_btn.setEnabled(False)
+        self.jt_start_btn.setEnabled(False)
+        self.back_to_back_action.setEnabled(False)
+        self.jv_stop_btn.setEnabled(True)
+
+        # Reset elapsed‑time counter
+        self.elapsed_start_time = time.time()
+        self.elapsed_time_label.setText("Elapsed Time: 0.0 s")
+
+        # --- compute set‑points (unchanged except for variable names) -----------
         mode = self.jv_mode_combobox.currentText()
         if mode == "Standard sweep":
-            if start_v < stop_v:
-                n_points = int(np.ceil((stop_v - start_v) / step_size)) + 1
-            else:
-                n_points = int(np.ceil((start_v - stop_v) / step_size)) + 1
+            n_points = int(np.ceil(abs(stop_v - start_v) / step)) + 1
             self.jv_setpoints = np.linspace(start_v, stop_v, n_points)
-        elif mode == "Zero centered":
+        else:  # Zero‑centred
 
-            def seg_points(a, b):
-                n = int(np.ceil(abs(b - a) / step_size)) + 1
+            def seg(a, b):
+                n = int(np.ceil(abs(b - a) / step)) + 1
                 return np.linspace(a, b, n)
 
-            seg1 = seg_points(0, start_v)
-            seg2 = seg_points(start_v, stop_v)[1:]
-            seg3 = seg_points(stop_v, 0)[1:]
-            self.jv_setpoints = np.concatenate((seg1, seg2, seg3))
-        else:
-            self.jv_setpoints = np.linspace(start_v, stop_v, 2)
+            self.jv_setpoints = np.concatenate(
+                (seg(0, start_v), seg(start_v, stop_v)[1:], seg(stop_v, 0)[1:])
+            )
+        self.jv_timer_delay = step / speed
 
-        # Compute delay between steps (time per step = step_size / sweep_speed)
-        self.jv_timer_delay = step_size / sweep_speed
-
-        # Handle multiple cycles
+        # --- handle multiple cycles (unchanged) ---------------------------------
         if self.multiple_cycles_checkbox.isChecked():
             try:
                 self.jv_total_cycles = int(self.jv_cycle_input.text())
                 if self.jv_total_cycles < 1:
-                    raise ValueError("Number of cycles must be at least 1.")
-            except ValueError as e:
+                    raise ValueError
+            except ValueError:
                 QMessageBox.warning(
-                    self, "Parameter Error", f"Invalid cycle number: {e}"
+                    self, "Parameter Error", "Number of cycles must be ≥ 1."
                 )
                 return
         else:
             self.jv_total_cycles = 1
 
-        # Reset JV data
-        self.jv_index = 0
-        self.jv_current_cycle = 0
+        # --- reset data and create live CSV (unchanged) --------------------------
+        self.jv_index = self.jv_current_cycle = 0
         self.jv_cycle_data = []
         self.jv_current_cycle_data_voltage = []
         self.jv_current_cycle_data_current = []
-
-        # Open a live CSV file for JV data
-        live_filename = self.get_live_csv_filename("JV")
+        live_name = self.get_live_csv_filename("JV")
         try:
-            self.jv_live_file = open(live_filename, "w")
-            if self.multiple_cycles_checkbox.isChecked():
-                self.jv_live_file.write("Cycle,Voltage (V),Current (A)\n")
-            else:
-                self.jv_live_file.write("Voltage (V),Current (A)\n")
+            self.jv_live_file = open(live_name, "w")
+            header = (
+                "Cycle,Voltage (V),Current (A)\n"
+                if self.multiple_cycles_checkbox.isChecked()
+                else "Voltage (V),Current (A)\n"
+            )
+            self.jv_live_file.write(header)
         except Exception as e:
             QMessageBox.warning(
                 self, "File Error", f"Could not open live CSV file:\n{e}"
             )
             self.jv_live_file = None
 
-        # Set instrument parameters
+        # --- configure instrument and UI (unchanged) ----------------------------
         self.smu.source_voltage_range(max(abs(start_v), abs(stop_v)))
         self.smu.source_current_compliance(1e-3)
         self.smu.output_enabled(True)
-
-        # Switch to JV plot tab and update title
         self.plot_tabs.setCurrentIndex(0)
         self.jv_plot_canvas.ax.clear()
         self.jv_plot_canvas.ax.set_xlabel("Voltage (V)")
         self.jv_plot_canvas.ax.set_ylabel("Current (A)")
         self.jv_plot_canvas.ax.set_title(f"JV Curve - {self.experiment_name}")
         self.jv_plot_canvas.draw()
-
         self.jv_timer.start(int(self.jv_timer_delay * 1000))
 
+    # ---------------------------------------------------------------------------
+
+    # --- update_jv_measurement (replace the whole method) -----------------------
     def update_jv_measurement(self):
+        # Update elapsed‑time display
+        elapsed = time.time() - self.elapsed_start_time
+        self.elapsed_time_label.setText(f"Elapsed Time: {elapsed:0.1f} s")
+
         if self.jv_index < len(self.jv_setpoints):
-            voltage_set = self.jv_setpoints[self.jv_index]
-            self.smu.source_voltage(voltage_set)
+            v_set = self.jv_setpoints[self.jv_index]
+            self.smu.source_voltage(v_set)
             time.sleep(0.05)
-            meas_voltage = self.smu.sense_voltage()
-            meas_current = self.smu.sense_current()
-            self.jv_current_cycle_data_voltage.append(meas_voltage)
-            self.jv_current_cycle_data_current.append(meas_current)
-            # Append live CSV row
+            v_meas = self.smu.sense_voltage()
+            i_meas = self.smu.sense_current()
+            self.jv_current_cycle_data_voltage.append(v_meas)
+            self.jv_current_cycle_data_current.append(i_meas)
+
             if self.jv_live_file:
                 if self.multiple_cycles_checkbox.isChecked():
                     self.jv_live_file.write(
-                        f"{self.jv_current_cycle + 1},{meas_voltage},{meas_current}\n"
+                        f"{self.jv_current_cycle + 1},{v_meas},{i_meas}\n"
                     )
                 else:
-                    self.jv_live_file.write(f"{meas_voltage},{meas_current}\n")
+                    self.jv_live_file.write(f"{v_meas},{i_meas}\n")
                 self.jv_live_file.flush()
+
             self.plot_jv_cycles()
             self.jv_index += 1
-        else:
-            # End of current cycle
-            if self.multiple_cycles_checkbox.isChecked():
-                self.jv_cycle_data.append(
-                    (
-                        np.array(self.jv_current_cycle_data_voltage),
-                        np.array(self.jv_current_cycle_data_current),
-                    )
-                )
-            else:
-                self.jv_cycle_data = []
-            self.jv_current_cycle += 1
-            if self.jv_current_cycle < self.jv_total_cycles:
-                self.jv_index = 0
-                self.jv_current_cycle_data_voltage = []
-                self.jv_current_cycle_data_current = []
-            else:
-                self.jv_timer.stop()
-                self.smu.output_enabled(False)
-                if self.jv_live_file:
-                    self.jv_live_file.close()
-                    self.jv_live_file = None
-                if self.auto_output and self.output_folder:
-                    self.auto_export_jv()
-                if self.back_to_back:
-                    self.back_to_back = False
-                    self.start_jt_measurement()
+            return  # still running
 
+        # --- completed one cycle or all cycles ----------------------------------
+        if self.multiple_cycles_checkbox.isChecked():
+            self.jv_cycle_data.append(
+                (
+                    np.array(self.jv_current_cycle_data_voltage),
+                    np.array(self.jv_current_cycle_data_current),
+                )
+            )
+        else:
+            self.jv_cycle_data = []
+        self.jv_current_cycle += 1
+
+        if self.jv_current_cycle < self.jv_total_cycles:
+            self.jv_index = 0
+            self.jv_current_cycle_data_voltage = []
+            self.jv_current_cycle_data_current = []
+            return  # start next cycle
+
+        # --- fully finished JV measurement --------------------------------------
+        self.jv_timer.stop()
+        self.smu.output_enabled(False)
+        if self.jv_live_file:
+            self.jv_live_file.close()
+            self.jv_live_file = None
+        if self.auto_output and self.output_folder:
+            self.auto_export_jv()
+
+        QMessageBox.information(self, "JV Measurement", "JV measurement completed.")
+
+        # Re‑enable controls (unless a JT run is about to start)
+        if not self.back_to_back:
+            self.jv_start_btn.setEnabled(True)
+            self.jv_stop_btn.setEnabled(False)
+            self.jt_start_btn.setEnabled(True)
+            self.back_to_back_action.setEnabled(True)
+            self.elapsed_time_label.setText("Elapsed Time: 0.0 s")
+
+        if self.back_to_back:
+            self.back_to_back = False
+            self.start_jt_measurement()
+
+    # ---------------------------------------------------------------------------
     def plot_jv_cycles(self):
         self.jv_plot_canvas.ax.clear()
         if self.multiple_cycles_checkbox.isChecked():
@@ -497,6 +521,13 @@ class MeasurementApp(QMainWindow):
         if self.jv_live_file:
             self.jv_live_file.close()
             self.jv_live_file = None
+
+        # Reset UI
+        self.jv_start_btn.setEnabled(True)
+        self.jv_stop_btn.setEnabled(False)
+        self.jt_start_btn.setEnabled(True)
+        self.back_to_back_action.setEnabled(True)
+        self.elapsed_time_label.setText("Elapsed Time: 0.0 s")
 
     def export_jv_csv(self):
         if (not self.jv_cycle_data) and (not self.jv_current_cycle_data_voltage):
@@ -640,64 +671,81 @@ class MeasurementApp(QMainWindow):
                 self, "Instrument Error", "Please connect to the instrument first."
             )
             return
+        # --- validate parameters (unchanged) ------------------------------------
         try:
-            hold_voltage = float(self.jt_hold_voltage.text())
-            total_time_val = float(self.jt_total_time.text())
-            sample_interval_val = float(self.jt_sample_interval.text())
+            hold_v = float(self.jt_hold_voltage.text())
+            tot = float(self.jt_total_time.text())
+            step = float(self.jt_sample_interval.text())
         except ValueError as e:
             QMessageBox.warning(self, "Parameter Error", f"Invalid JT parameter: {e}")
             return
-        # Convert time values to seconds based on selected units
+
         units = {"seconds": 1, "minutes": 60, "hours": 3600}
-        total_time_factor = units[self.jt_total_time_unit.currentText()]
-        sample_interval_factor = units[self.jt_sample_interval_unit.currentText()]
-        total_time_seconds = total_time_val * total_time_factor
-        sample_interval_seconds = sample_interval_val * sample_interval_factor
-        if total_time_seconds <= 0 or sample_interval_seconds <= 0:
+        total_seconds = tot * units[self.jt_total_time_unit.currentText()]
+        sample_seconds = step * units[self.jt_sample_interval_unit.currentText()]
+        if total_seconds <= 0 or sample_seconds <= 0:
             QMessageBox.warning(
                 self, "Parameter Error", "Time values must be positive."
             )
             return
 
-        self.smu.source_voltage(hold_voltage)
+        # Disable “run” controls, enable Stop
+        self.jt_start_btn.setEnabled(False)
+        self.jv_start_btn.setEnabled(False)
+        self.back_to_back_action.setEnabled(False)
+        self.jt_stop_btn.setEnabled(True)
+
+        # Reset elapsed‑time counter
+        self.elapsed_start_time = time.time()
+        self.elapsed_time_label.setText("Elapsed Time: 0.0 s")
+
+        # --- configure instrument (unchanged) -----------------------------------
+        self.smu.source_voltage(hold_v)
         self.smu.output_enabled(True)
         self.jt_start_time = time.time()
         self.jt_time_data = []
         self.jt_current_data = []
 
-        # Open live CSV file for JT data
-        live_filename = self.get_live_csv_filename("JT")
+        # open live csv (unchanged) ----------------------------------------------
+        live_name = self.get_live_csv_filename("JT")
         try:
-            self.jt_live_file = open(live_filename, "w")
+            self.jt_live_file = open(live_name, "w")
             self.jt_live_file.write("Time (s),Current (A)\n")
         except Exception as e:
             QMessageBox.warning(
-                self, "File Error", f"Could not open live CSV file for JT:\n{e}"
+                self, "File Error", f"Could not open live CSV file:\n{e}"
             )
             self.jt_live_file = None
 
+        # plot config (unchanged) -------------------------------------------------
         self.plot_tabs.setCurrentIndex(1)
         self.jt_plot_canvas.ax.clear()
         self.jt_plot_canvas.ax.set_xlabel("Time (s)")
         self.jt_plot_canvas.ax.set_ylabel("Current (A)")
         self.jt_plot_canvas.ax.set_title(f"JT Curve - {self.experiment_name}")
         self.jt_plot_canvas.draw()
-        self.jt_timer.start(int(sample_interval_seconds * 1000))
-        # Store total time in seconds for checking in the update
-        self.jt_total_time_seconds = total_time_seconds
 
+        self.jt_total_time_seconds = total_seconds
+        self.jt_timer.start(int(sample_seconds * 1000))
+
+    # ---------------------------------------------------------------------------
+
+    # --- update_jt_measurement (replace the whole method) -----------------------
     def update_jt_measurement(self):
         elapsed = time.time() - self.jt_start_time
-        if elapsed > self.jt_total_time_seconds:
-            self.stop_jt_measurement()
+        self.elapsed_time_label.setText(f"Elapsed Time: {elapsed:0.1f} s")
+
+        if elapsed >= self.jt_total_time_seconds:
+            self.stop_jt_measurement(completed=True)
             return
+
         current = self.smu.sense_current()
         self.jt_time_data.append(elapsed)
         self.jt_current_data.append(current)
-        # Append live CSV row
         if self.jt_live_file:
             self.jt_live_file.write(f"{elapsed},{current}\n")
             self.jt_live_file.flush()
+
         self.jt_plot_canvas.ax.clear()
         self.jt_plot_canvas.ax.plot(self.jt_time_data, self.jt_current_data, marker="o")
         self.jt_plot_canvas.ax.set_xlabel("Time (s)")
@@ -705,15 +753,27 @@ class MeasurementApp(QMainWindow):
         self.jt_plot_canvas.ax.set_title(f"JT Curve - {self.experiment_name}")
         self.jt_plot_canvas.draw()
 
-    def stop_jt_measurement(self):
+    # ---------------------------------------------------------------------------
+
+    def stop_jt_measurement(self, *, completed=False):
         self.jt_timer.stop()
         if self.smu:
             self.smu.output_enabled(False)
         if self.jt_live_file:
             self.jt_live_file.close()
             self.jt_live_file = None
-        if self.auto_output and self.output_folder:
+        if self.auto_output and self.output_folder and completed:
             self.auto_export_jt()
+
+        # Reset UI
+        self.jt_start_btn.setEnabled(True)
+        self.jt_stop_btn.setEnabled(False)
+        self.jv_start_btn.setEnabled(True)
+        self.back_to_back_action.setEnabled(True)
+        self.elapsed_time_label.setText("Elapsed Time: 0.0 s")
+
+        if completed:
+            QMessageBox.information(self, "JT Measurement", "JT measurement completed.")
 
     def export_jt_csv(self):
         if not self.jt_time_data or not self.jt_current_data:
