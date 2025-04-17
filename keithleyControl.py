@@ -96,7 +96,8 @@ class MeasurementApp(QMainWindow):
         self.create_jv_tab()
         self.create_jt_tab()
         self.create_settings_tab()
-
+        self.jv_stop_btn.setEnabled(False)
+        self.jt_stop_btn.setEnabled(False)
         main_layout.addWidget(left_panel, 0)
 
         # --- Right Panel (Plot Area) ---
@@ -135,6 +136,8 @@ class MeasurementApp(QMainWindow):
         self.jt_start_time = None
         self.jt_time_data = []
         self.jt_current_data = []
+        self.elapsed_time_label = QtWidgets.QLabel("Elapsed Time: 0.0 s")
+        self.statusBar().addPermanentWidget(self.elapsed_time_label)
 
     # --- Helper: Live CSV Filename ---
     def get_live_csv_filename(self, measurement_type):
@@ -305,13 +308,10 @@ class MeasurementApp(QMainWindow):
         self.jv_stop_btn = QPushButton("Stop JV")
         self.jv_stop_btn.clicked.connect(self.stop_jv_measurement)
         self.jv_stop_btn.setEnabled(False)
-        self.jt_stop_btn.setEnabled(False)
         btn_layout.addWidget(self.jv_stop_btn)
         layout.addLayout(btn_layout)
 
         self.control_tabs.addTab(self.jv_tab, "JV Sweep")
-        self.elapsed_time_label = QtWidgets.QLabel("Elapsed Time: 0.0 s")
-        self.statusBar().addPermanentWidget(self.elapsed_time_label)
 
     def toggle_cycle_input(self, state):
         self.jv_cycle_input.setEnabled(state == QtCore.Qt.Checked)
