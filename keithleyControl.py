@@ -16,10 +16,12 @@ from pymeasure.display.Qt import QtWidgets
 from pymeasure.display.windows.managed_dock_window import ManagedDockWindow
 from pymeasure.experiment import Procedure
 from pymeasure.experiment import (
+    Parameter,
     IntegerParameter,
     FloatParameter,
     ListParameter,
     BooleanParameter,
+    Metadata
 )
 
 # Testing mode, uses dummy driver
@@ -28,11 +30,11 @@ test = True
 
 class JVJTProcedure(Procedure):
     measurement_mode = ListParameter(
-        "Measurement_mode",
-        ["JV (current/voltage)", "JT (current/time)"],
-        default="JV (current/voltage)",
+        "Measurement mode",
+        ["JV", "JT"],
+        default="JV",
     )
-
+    identifier = Parameter("Identifier", default="Device")
     # NPLC settings
     max_speed = BooleanParameter("Maximize Measurement Speed", default=False)
     nplc_val = FloatParameter(
@@ -44,35 +46,35 @@ class JVJTProcedure(Procedure):
         units="V",
         default=-10,
         group_by="measurement_mode",
-        group_condition="JV (current/voltage)",
+        group_condition="JV",
     )
     maximum_voltage = FloatParameter(
         "Maximum Voltage",
         units="V",
         default=10,
         group_by="measurement_mode",
-        group_condition="JV (current/voltage)",
+        group_condition="JV",
     )
     step_size = FloatParameter(
         "Step Size",
         units="V",
         default=1,
         group_by="measurement_mode",
-        group_condition="JV (current/voltage)",
+        group_condition="JV",
     )
     sweep_speed = FloatParameter(
         "Sweep Speed",
         units="V/s",
         default=1,
         group_by="measurement_mode",
-        group_condition="JV (current/voltage)",
+        group_condition="JV",
     )
     sweep_mode = ListParameter(
         "Sweep Type",
         ["Standard Sweep", "Zero-Centered"],
         default="Standard Sweep",
         group_by="measurement_mode",
-        group_condition="JV (current/voltage)",
+        group_condition="JV",
     )
 
     # JT Params
@@ -81,28 +83,27 @@ class JVJTProcedure(Procedure):
         units="V",
         default=1,
         group_by="measurement_mode",
-        group_condition="JT (current/time)",
+        group_condition="JT",
     )
     indefinite_measurement = BooleanParameter(
         "Indefinite Measurement",
         default=False,
         group_by="measurement_mode",
-        group_condition="JT (current/time)",
+        group_condition="JT",
     )
     measurement_time = IntegerParameter(
         "Measurement Duration",
         units="S",
         default=30,
-        group_by={"measurement_mode": "JT (current/time)", "indefinite_measurement":False},
+        group_by={"measurement_mode": "JT", "indefinite_measurement": False},
     )
     measurement_interval = FloatParameter(
         "Measurement Interval",
         units="S",
         default=1,
         group_by="measurement_mode",
-        group_condition="JT (current/time)",
+        group_condition="JT",
     )
-
 
     DATA_COLUMNS = [
         "Current JV (A)",
@@ -146,15 +147,15 @@ class JVJTProcedure(Procedure):
                     raise RuntimeError(
                         "No instrument found. Please check the connection."
                     )
-
+        sourcemeter_type = Metadata("sourcemeter_type",default=self.Sourcemeter_type)
         self.sourcemeter.reset()
-
+        
         if self.max_speed:
             # Pull out all the stops to maximize the speed
             self.nplc_val = 0.01
             self.sourcemeter.write(":DISPlay:DIGits MINimum")
-            #digitval = self.sourcemeter.ask(":DISPlay:DIGits?")
-            #log.info("Display digits set to: %g" % int(digitval))
+            # digitval = self.sourcemeter.ask(":DISPlay:DIGits?")
+            # log.info("Display digits set to: %g" % int(digitval))
             self.sourcemeter.filter_state = "OFF"
             self.sourcemeter.auto_zero = False
             self.sourcemeter.display_enabled = False
@@ -173,7 +174,7 @@ class JVJTProcedure(Procedure):
         log.info("Instrument setup complete.")
 
     def execute(self):
-        if self.measurement_mode == "JV (current/voltage)":
+        if self.measurement_mode == "JV":
             log.info("Starting JV Measurement")
             # Generate voltage sequence based on sweep mode
             if self.step_size <= 0:
@@ -306,7 +307,7 @@ class JVJTProcedure(Procedure):
 
             log.info("JV Measurement finished.")
 
-        elif self.measurement_mode == "JT (current/time)":
+        elif self.measurement_mode == "JT":
             log.info("Starting JT Measurement")
             if self.measurement_interval <= 0:
                 log.error("Measurement interval must be positive.")
@@ -439,9 +440,9 @@ class MainWindow(ManagedDockWindow):
                 "sweep_speed",
                 "sweep_mode",
                 "hold_voltage",
-
                 "measurement_time",
                 "measurement_interval",
+                "identifier",
             ],
             displays=[
                 "measurement_mode",
@@ -460,6 +461,31 @@ class MainWindow(ManagedDockWindow):
             linewidth=3,
         )
         self.setWindowTitle("GUI Example")
+        self.directory = r"Output"
+
+        self.filename = r"{Identifier}_{Measurement mode}_{date}_{time}"
+        self._setup_menu()
+
+    def _setup_menu(self):
+        # Get the menu bar provided by QMainWindow
+        menu_bar = self.menuBar()
+
+        # Create File menu
+        file_menu = menu_bar.addMenu("&File")
+
+        # Add Exit action
+        exit_action = QtWidgets.QAction("&Exit", self)
+        exit_action.triggered.connect(
+            self.close
+        )  # Connect to the window's close method
+        # Or connect directly to app quit: exit_action.triggered.connect(QtWidgets.QApplication.instance().quit)
+        file_menu.addAction(exit_action)
+
+        # You can add other menus (Edit, View, Help) and actions here
+        # help_menu = menu_bar.addMenu("&Help")
+        # about_action = QtWidgets.QAction("&About", self)
+        # help_menu.addAction(about_action)
+        # # Connect about_action.triggered to a function that shows an about dialog
 
 
 if __name__ == "__main__":
