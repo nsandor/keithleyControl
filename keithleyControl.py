@@ -9,6 +9,8 @@ from time import sleep
 from pymeasure.log import log
 from pymeasure.adapters import VISAAdapter, PrologixAdapter
 from drivers.dummy_keithley import DummyKeithley2400
+
+# Both the 6430 and 2450 use essentially the same commands, so the 2400 driver works fine
 from pymeasure.instruments.keithley import Keithley2400
 from pymeasure.display.Qt import QtWidgets
 from pymeasure.display.windows.managed_dock_window import ManagedDockWindow
@@ -32,8 +34,10 @@ class JVJTProcedure(Procedure):
     )
 
     # NPLC settings
-    nplc_val = FloatParameter("NPLC value", default=10)
-    experiment_time = FloatParameter("Experiment Time", default=1)
+    max_speed = BooleanParameter("Maximize Measurement Speed", default=False)
+    nplc_val = FloatParameter(
+        "NPLC value", default=10, group_by="max_speed", group_condition=False
+    )
     # JV Params
     minimum_voltage = FloatParameter(
         "Minimum Voltage",
@@ -79,15 +83,17 @@ class JVJTProcedure(Procedure):
         group_by="measurement_mode",
         group_condition="JT (current/time)",
     )
+    indefinite_measurement = BooleanParameter(
+        "Indefinite Measurement",
+        default=False,
+        group_by="measurement_mode",
+        group_condition="JT (current/time)",
+    )
     measurement_time = IntegerParameter(
         "Measurement Duration",
         units="S",
         default=30,
-        group_by=["measurement_mode", "indefinite_measurement"],
-        group_condition={
-            "measurement_mode": "JT (current/time)",
-            "indefinite_measurement": False,
-        },
+        group_by={"measurement_mode": "JT (current/time)", "indefinite_measurement":False},
     )
     measurement_interval = FloatParameter(
         "Measurement Interval",
@@ -96,27 +102,24 @@ class JVJTProcedure(Procedure):
         group_by="measurement_mode",
         group_condition="JT (current/time)",
     )
-    indefinite_measurement = BooleanParameter(
-        "Indefinite Measurement",
-        default=False,
-        group_by="measurement_mode",
-        group_condition="JT (current/time)",
-    )
+
 
     DATA_COLUMNS = [
         "Current JV (A)",
         "Voltage JV (V)",
         "Time JV (S)",
         "Current JT (A)",
-        "Voltage JV (V)",
+        "Voltage JT (V)",
         "Time JT (S)",
     ]
 
     def startup(self):
         log.info("Setting up instrument")
-
+        self.Sourcemeter_type = None
         if test:
             self.sourcemeter = DummyKeithley2400()  # Dummy instrument
+            self.Connected = True
+            self.Sourcemeter_type = "Dummy"
             log.info("Connected to instrument.")
         else:
             try:
@@ -124,27 +127,47 @@ class JVJTProcedure(Procedure):
                     "ASRL4::INSTR", 7, gpib_read_timeout=3000
                 )
                 self.sourcemeter = Keithley2400(self.adapter)
+                self.Sourcemeter_type = "6430"
                 log.info("Connected to Prologix adapter.")
             except Exception:
                 log.info(
                     "No Prologix adapter found (no 6400 here), trying VISA adapter, maybe the 2450 is connected?."
                 )
-            try:
-                # Attempt to use VISA adapter if available
-                self.adapter = VISAAdapter("USB0::0x05E6::0x2450::04491080::INSTR")
-                self.sourcemeter = Keithley2400(self.adapter)
-                log.info("Connected to VISA adapter.")
-            except Exception:
-                log.info("No sourcemeter found, is one plugged in?")
-                # If no instrument is found, raise an error
-                raise RuntimeError("No instrument found. Please check the connection.")
+            if self.Sourcemeter_type is None:
+                try:
+                    # Attempt to use VISA adapter if available
+                    self.adapter = VISAAdapter("USB0::0x05E6::0x2450::04491080::INSTR")
+                    self.sourcemeter = Keithley2400(self.adapter)
+                    self.Sourcemeter_type = "2450"
+                    log.info("Connected to VISA adapter.")
+                except Exception:
+                    log.info("No sourcemeter found, is one plugged in?")
+                    # If no instrument is found, raise an error
+                    raise RuntimeError(
+                        "No instrument found. Please check the connection."
+                    )
 
         self.sourcemeter.reset()
+
+        if self.max_speed:
+            # Pull out all the stops to maximize the speed
+            self.nplc_val = 0.01
+            self.sourcemeter.write(":DISPlay:DIGits MINimum")
+            #digitval = self.sourcemeter.ask(":DISPlay:DIGits?")
+            #log.info("Display digits set to: %g" % int(digitval))
+            self.sourcemeter.filter_state = "OFF"
+            self.sourcemeter.auto_zero = False
+            self.sourcemeter.display_enabled = False
+
         # Configure measurement parameters common to both modes
         self.sourcemeter.measure_current(
             nplc=self.nplc_val
         )  # Adjust current limit as needed
         sleep(0.1)  # Allow time for settings to apply
+
+        if self.Sourcemeter_type == "2450":
+            self.sourcemeter.use_rear_terminals()
+
         self.sourcemeter.stop_buffer()
         self.sourcemeter.disable_buffer()
         log.info("Instrument setup complete.")
@@ -152,12 +175,10 @@ class JVJTProcedure(Procedure):
     def execute(self):
         if self.measurement_mode == "JV (current/voltage)":
             log.info("Starting JV Measurement")
-
             # Generate voltage sequence based on sweep mode
             if self.step_size <= 0:
                 log.error("Step size must be positive for JV sweep.")
                 return  # Stop execution
-
             if self.sweep_mode == "Standard Sweep":
                 num_steps = (
                     int(
@@ -281,7 +302,6 @@ class JVJTProcedure(Procedure):
                     "Time JT (S)": np.nan,
                 }
                 self.emit("results", data)
-                self.emit("experiment_time", elapsed_time)
                 self.emit("progress", 100 * (count + 1) / total_steps)
 
             log.info("JV Measurement finished.")
@@ -336,7 +356,7 @@ class JVJTProcedure(Procedure):
                 )
 
                 data = {
-                    "Current JV (A)": np.nan,  # Use NaN for columns not relevant to this mode
+                    "Current JV (A)": np.nan,
                     "Voltage JV (V)": np.nan,
                     "Time JV (S)": np.nan,
                     "Current JT (A)": current,
@@ -355,7 +375,6 @@ class JVJTProcedure(Procedure):
                         ),
                     )
                     self.emit("progress", progress)
-                self.emit("experiment_time", actual_measurement_time_point)
                 measurement_count += 1
 
                 # Calculate the time until the next measurement should ideally start
@@ -394,14 +413,8 @@ class JVJTProcedure(Procedure):
 
     def shutdown(self):
         if hasattr(self, "sourcemeter"):
-            # Turn off the output, return voltage to zero if safe
-            log.info("Ramping voltage to 0 V.")
-            self.sourcemeter.ramp_to_voltage(
-                0, steps=10, pause=0.05
-            )  # Ramp down smoothly
             self.sourcemeter.disable_source()
             log.info("Source disabled.")
-            # Uncomment the following line if using a real instrument that needs shutdown
             self.sourcemeter.shutdown()
             log.info("Instrument shutdown procedure called.")
         if hasattr(self, "adapter"):
@@ -417,6 +430,8 @@ class MainWindow(ManagedDockWindow):
             procedure_class=JVJTProcedure,
             inputs=[
                 "measurement_mode",
+                "indefinite_measurement",
+                "max_speed",
                 "nplc_val",
                 "minimum_voltage",
                 "maximum_voltage",
@@ -424,13 +439,13 @@ class MainWindow(ManagedDockWindow):
                 "sweep_speed",
                 "sweep_mode",
                 "hold_voltage",
+
                 "measurement_time",
                 "measurement_interval",
             ],
             displays=[
                 "measurement_mode",
                 "nplc_val",
-                "experiment_time",
                 "minimum_voltage",
                 "maximum_voltage",
                 "step_size",
