@@ -10,7 +10,8 @@ from time import sleep
 from pymeasure.log import log
 from pymeasure.adapters import VISAAdapter, PrologixAdapter
 from drivers.dummy_keithley import DummyKeithley2400
-from PyQt5.QtGui import QIcon # Add this import
+from PyQt5.QtGui import QIcon  # Add this import
+
 # Both the 6430 and 2450 use essentially the same commands, so the 2400 driver works fine
 from pymeasure.instruments.keithley import Keithley2400
 from pymeasure.display.Qt import QtWidgets
@@ -22,14 +23,15 @@ from pymeasure.experiment import (
     FloatParameter,
     ListParameter,
     BooleanParameter,
-    Metadata
+    Metadata,
 )
 
 # Testing mode, uses dummy driver
 test = True
 
+
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
+    """Get absolute path to resource, works for dev and for PyInstaller"""
     try:
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
@@ -126,6 +128,8 @@ class JVJTProcedure(Procedure):
         "Time JT (S)",
     ]
 
+    #sourcemetr = Metadata("Sourcemeter")
+
     def startup(self):
         log.info("Setting up instrument")
         self.Sourcemeter_type = None
@@ -159,9 +163,8 @@ class JVJTProcedure(Procedure):
                     raise RuntimeError(
                         "No instrument found. Please check the connection."
                     )
-        sourcemeter_type = Metadata("sourcemeter_type",default=self.Sourcemeter_type)
         self.sourcemeter.reset()
-        
+        sourcemetr = self.Sourcemeter_type
         if self.max_speed:
             # Pull out all the stops to maximize the speed
             self.nplc_val = 0.01
@@ -184,6 +187,28 @@ class JVJTProcedure(Procedure):
         self.sourcemeter.stop_buffer()
         self.sourcemeter.disable_buffer()
         log.info("Instrument setup complete.")
+
+    def chime(self):
+        def chime(self):
+            """Plays a C-A-F major chord sequence using the system beep for test completion.
+            Real ones know where this is from."""
+            if hasattr(self.sourcemeter, "triad"):
+                try:
+                    # Base frequencies for C, A, and F notes in Hz
+                    c_freq = 261.63  # Middle C
+                    a_freq = 440.00  # A4
+                    f_freq = 349.23  # F4
+                    duration = 0.5  # Duration of each chord in seconds
+
+                    self.sourcemeter.triad(c_freq, duration)
+                    time.sleep(duration)
+                    self.sourcemeter.triad(a_freq, duration)
+                    time.sleep(duration)
+                    self.sourcemeter.triad(f_freq, duration)
+                except Exception as e:
+                    log.warning(f"Failed to play chime: {e}")
+            else:
+                log.warning("Sourcemeter does not support triad functionality.")
 
     def execute(self):
         if self.measurement_mode == "JV":
@@ -316,7 +341,7 @@ class JVJTProcedure(Procedure):
                 }
                 self.emit("results", data)
                 self.emit("progress", 100 * (count + 1) / total_steps)
-
+            self.chime()
             log.info("JV Measurement finished.")
 
         elif self.measurement_mode == "JT":
@@ -417,7 +442,7 @@ class JVJTProcedure(Procedure):
                 and elapsed_time >= self.measurement_time
             ):
                 log.warning("User aborted the procedure during JT measurement.")
-
+            self.chime()
             log.info("JT Measurement finished.")
 
     def shutdown(self):
@@ -469,8 +494,8 @@ class MainWindow(ManagedDockWindow):
             linewidth=3,
         )
         self.setWindowTitle("Keithley Control")
-        icon_path = resource_path("res/icons/Appicon.png") # New line
-        self.setWindowIcon(QIcon(icon_path))              # New line
+        icon_path = resource_path("res/icons/Appicon.png")  # New line
+        self.setWindowIcon(QIcon(icon_path))  # New line
         self.directory = r"Output"
 
         self.filename = r"{Identifier}_{Measurement mode}_{date}"
