@@ -4,12 +4,13 @@ log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
 import numpy as np
 import sys
+import os  # Import the os module
 import time  # Import the time module
 from time import sleep
 from pymeasure.log import log
 from pymeasure.adapters import VISAAdapter, PrologixAdapter
 from drivers.dummy_keithley import DummyKeithley2400
-
+from PyQt5.QtGui import QIcon # Add this import
 # Both the 6430 and 2450 use essentially the same commands, so the 2400 driver works fine
 from pymeasure.instruments.keithley import Keithley2400
 from pymeasure.display.Qt import QtWidgets
@@ -26,6 +27,17 @@ from pymeasure.experiment import (
 
 # Testing mode, uses dummy driver
 test = True
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        # Not running in PyInstaller bundle, use script's directory
+        base_path = os.path.abspath(os.path.dirname(__file__))
+
+    return os.path.join(base_path, relative_path)
 
 
 class JVJTProcedure(Procedure):
@@ -352,10 +364,6 @@ class JVJTProcedure(Procedure):
                     measurement_end_time - start_time
                 )  # Time relative to start
 
-                log.info(
-                    f"Time: {actual_measurement_time_point:.2f}s, Measured Current: {current:.4e} A"
-                )
-
                 data = {
                     "Current JV (A)": np.nan,
                     "Voltage JV (V)": np.nan,
@@ -460,10 +468,12 @@ class MainWindow(ManagedDockWindow):
             y_axis=["Current JV (A)", "Current JT (A)"],
             linewidth=3,
         )
-        self.setWindowTitle("GUI Example")
+        self.setWindowTitle("Keithley Control")
+        icon_path = resource_path("res/icons/Appicon.png") # New line
+        self.setWindowIcon(QIcon(icon_path))              # New line
         self.directory = r"Output"
 
-        self.filename = r"{Identifier}_{Measurement mode}_{date}_{time}"
+        self.filename = r"{Identifier}_{Measurement mode}_{date}"
         self._setup_menu()
 
     def _setup_menu(self):

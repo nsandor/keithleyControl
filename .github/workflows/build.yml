@@ -28,11 +28,11 @@ jobs:
       - name: Build executable with PyInstaller
         run: |
           pyinstaller `
-            -i res/icons/AppIcon.png `
-            --windowed `
-            --onefile `
-            --additional-hooks-dir .github/pyinstaller-hooks `
-            keithleyControl.py
+          --windowed `
+          --icon="res/icons/Appicon.png" `
+          --add-data="res/icons/Appicon.png;res/icons" `
+          --add-data="JVJTProcedure_dock_layout.json;." `
+          keithleyControl.py`
         shell: pwsh
 
       - name: Upload artifact
