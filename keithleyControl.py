@@ -127,8 +127,9 @@ class JVJTProcedure(Procedure):
         "Voltage JT (V)",
         "Time JT (S)",
     ]
-
-    #sourcemetr = Metadata("Sourcemeter")
+        
+    sm_type_metadata = Metadata("Sourcemeter Type", default="None")
+    test_time_metadata = Metadata("Test Time", default="None")
 
     def startup(self):
         log.info("Setting up instrument")
@@ -164,7 +165,6 @@ class JVJTProcedure(Procedure):
                         "No instrument found. Please check the connection."
                     )
         self.sourcemeter.reset()
-        sourcemetr = self.Sourcemeter_type
         if self.max_speed:
             # Pull out all the stops to maximize the speed
             self.nplc_val = 0.01
@@ -186,6 +186,9 @@ class JVJTProcedure(Procedure):
 
         self.sourcemeter.stop_buffer()
         self.sourcemeter.disable_buffer()
+        # Set up some metadata
+        self.sm_type_metadata = self.Sourcemeter_type
+        self.test_time_metadata = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         log.info("Instrument setup complete.")
 
     def chime(self):

@@ -59,7 +59,7 @@ class DummyKeithley2400(FakeInstrument):
         adapter=None,
         name="Dummy Keithley 2400",
         *,
-        load_type="diode",
+        load_type="resistor",
         resistor_ohms=100e6,
         diode_Is=1e-12,
         diode_n=1.0,
@@ -271,10 +271,12 @@ class DummyKeithley2400(FakeInstrument):
             time.sleep(pause)
 
     def ramp_to_current(self, target_current, steps=30, pause=20e-3):
-        self._ramp(self.source_current.__set__, target_current, steps, pause)
+        #self._ramp(self.source_current.__set__, target_current, steps, pause)
+        pass
 
     def ramp_to_voltage(self, target_voltage, steps=30, pause=20e-3):
-        self._ramp(self.source_voltage.__set__, target_voltage, steps, pause)
+        #self._ramp(self.source_voltage.__set__, target_voltage, steps, pause)
+        pass
 
     # -- triggering stubs -------------------------------------------------
     def trigger(self):
