@@ -61,9 +61,9 @@ pyinstaller==6.12.0
 pyinstaller-hooks-contrib==2025.2
 PyMeasure==0.15.0
 pyparsing==3.2.3
-PyQt5==5.15.11
-PyQt5-Qt5==5.15.16
-PyQt5_sip==12.17.0
+PyQt5
+PyQt5-Qt5
+PyQt5_sip
 pyqtgraph==0.13.7
 pyserial==3.5
 python-dateutil==2.9.0.post0
