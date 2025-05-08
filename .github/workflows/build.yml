@@ -32,7 +32,7 @@ jobs:
           --icon="res/icons/Appicon.png" `
           --add-data="res/icons/Appicon.png;res/icons" `
           --add-data="JVJTProcedure_dock_layout.json;." `
-          keithleyControl.py`
+          keithleyControl.py
         shell: pwsh
 
       - name: Upload artifact
