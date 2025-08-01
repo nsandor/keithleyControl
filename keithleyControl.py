@@ -14,8 +14,10 @@ from PyQt5.QtGui import QIcon  # Add this import
 
 # -- Force a non‐GUI backend before importing pyplot --
 import matplotlib
-matplotlib.use('Agg')
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # For creating and saving your own plots
+
 # Both the 6430 and 2450 use essentially the same commands, so the 2400 driver works fine
 from pymeasure.instruments.keithley import Keithley2400
 from pymeasure.instruments.keithley import Keithley2450
@@ -132,15 +134,15 @@ class JVJTProcedure(Procedure):
         "Voltage JT (V)",
         "Time JT (S)",
     ]
-        
+
     sm_type_metadata = Metadata("Sourcemeter Type", default="None")
     test_time_metadata = Metadata("Test Time", default="None")
 
     def startup(self):
         log.info("Setting up instrument")
         # prepare data buffers for plotting later
-        self.jv_data = []   # will hold (voltage, current) tuples
-        self.jt_data = []   # will hold (time, current) tuples
+        self.jv_data = []  # will hold (voltage, current) tuples
+        self.jt_data = []  # will hold (time, current) tuples
         self.Sourcemeter_type = None
         if test:
             self.sourcemeter = DummyKeithley2400()  # Dummy instrument
@@ -154,10 +156,10 @@ class JVJTProcedure(Procedure):
                 )
                 self.adapter.connection.timeout = 20000  # ms
                 # Make absolutely sure the prologix is configured correctly
-                self.adapter.write('++mode 1')         # controller
-                self.adapter.write('++auto 0')         # *crucial* – we will read explicitly
-                self.adapter.write('++eoi 1')          # assert EOI with last byte
-                #self.adapter.write('++read_tmo_ms 5000')
+                self.adapter.write("++mode 1")  # controller
+                self.adapter.write("++auto 0")  # *crucial* – we will read explicitly
+                self.adapter.write("++eoi 1")  # assert EOI with last byte
+                # self.adapter.write('++read_tmo_ms 5000')
                 self.sourcemeter = Keithley2400(self.adapter)
                 self.Sourcemeter_type = "6430"
                 log.info("Connected to Prologix adapter.")
@@ -169,7 +171,6 @@ class JVJTProcedure(Procedure):
                 try:
                     # Attempt to use VISA adapter if available
                     self.adapter = VISAAdapter("USB0::0x05E6::0x2450::04491080::INSTR")
-
 
                     self.adapter.connection.timeout = 10000  # ms
                     self.sourcemeter = Keithley2400(self.adapter)
@@ -196,7 +197,7 @@ class JVJTProcedure(Procedure):
 
         # Configure measurement parameters common to both modes
         self.sourcemeter.measure_current(
-            nplc=self.nplc_val
+            nplc=self.nplc_val, current=0.000105
         )  # Adjust current limit as needed
         sleep(0.1)  # Allow time for settings to apply
 
@@ -205,8 +206,8 @@ class JVJTProcedure(Procedure):
 
         self.sourcemeter.stop_buffer()
         self.sourcemeter.disable_buffer()
-        self.sourcemeter.write('*OPC?')      # ask the universal Operation Complete bit
-        opcreadback = self.sourcemeter.read()              # wait here until the 6430 replies “1”
+        self.sourcemeter.write("*OPC?")  # ask the universal Operation Complete bit
+        opcreadback = self.sourcemeter.read()  # wait here until the 6430 replies “1”
         log.info(f"OPC read back as:{opcreadback}")
         # Set up some metadata
         self.sm_type_metadata = self.Sourcemeter_type
@@ -235,7 +236,6 @@ class JVJTProcedure(Procedure):
             else:
                 log.warning("Sourcemeter does not support triad functionality.")
 
-    
     def execute(self):
         if self.measurement_mode == "JV":
             log.info("Starting JV Measurement")
@@ -354,10 +354,10 @@ class JVJTProcedure(Procedure):
                 )
                 self.sourcemeter.source_voltage = voltage
                 # Measure current
-                #sleep(0.1)
-                #self.sourcemeter.write(":INIT")
-                #self.sourcemeter.write("*WAI")
-                #current = float(self.sourcemeter.ask(":FETCH?"))
+                # sleep(0.1)
+                # self.sourcemeter.write(":INIT")
+                # self.sourcemeter.write("*WAI")
+                # current = float(self.sourcemeter.ask(":FETCH?"))
                 current = self.sourcemeter.current
                 log.info(f"Measured current: {current:.4e} A")
                 elapsed_time = time.time() - experiment_start_time
@@ -480,7 +480,7 @@ class JVJTProcedure(Procedure):
         if hasattr(self, "sourcemeter"):
             self.sourcemeter.disable_source()
             log.info("Source disabled.")
-            #self.sourcemeter.shutdown()
+            # self.sourcemeter.shutdown()
             log.info("Instrument shutdown procedure called.")
         if hasattr(self, "adapter"):
             self.adapter.close()
@@ -496,7 +496,7 @@ class JVJTProcedure(Procedure):
             if self.jv_data:
                 volts, amps = zip(*self.jv_data)
                 fig, ax = plt.subplots()
-                ax.plot(volts, amps, marker='o', linestyle='-')
+                ax.plot(volts, amps, marker="o", linestyle="-")
                 ax.set_xlabel("Voltage (V)")
                 ax.set_ylabel("Current (A)")
                 ax.set_title(f"{self.identifier} JV Sweep")
@@ -509,7 +509,7 @@ class JVJTProcedure(Procedure):
             if self.jt_data:
                 times, amps = zip(*self.jt_data)
                 fig, ax = plt.subplots()
-                ax.plot(times, amps, marker='o', linestyle='-')
+                ax.plot(times, amps, marker="o", linestyle="-")
                 ax.set_xlabel("Time (s)")
                 ax.set_ylabel("Current (A)")
                 ax.set_title(f"{self.identifier} JT Measurement")
@@ -581,6 +581,7 @@ class MainWindow(ManagedDockWindow):
         )  # Connect to the window's close method
         # Or connect directly to app quit: exit_action.triggered.connect(QtWidgets.QApplication.instance().quit)
         file_menu.addAction(exit_action)
+
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
