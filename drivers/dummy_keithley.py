@@ -59,7 +59,7 @@ class DummyKeithley2400(FakeInstrument):
         adapter=None,
         name="Dummy Keithley 2400",
         *,
-        load_type="resistor",
+        load_type="constant",
         resistor_ohms=100e6,
         diode_Is=1e-12,
         diode_n=1.0,
@@ -69,6 +69,8 @@ class DummyKeithley2400(FakeInstrument):
         super().__init__(adapter=adapter, name=name, includeSCPI=False, **kwargs)
 
         # ---------- “hardware” config ----------
+        self.const_volt = 5.0  # constant voltage source (V)
+        self.const_curr = 0.1  # constant current source (A)
         self._load_type = load_type
         self._R_load = float(resistor_ohms)
         self._diode_Is = float(diode_Is)
@@ -104,7 +106,10 @@ class DummyKeithley2400(FakeInstrument):
     # --------------------------------------------------------------------- #
     def _simulate(self):
         """Return (V, I, R) tuple for present source settings."""
-        if self._source_mode == "voltage":
+        if self._load_type == "constant":
+            V = self.const_volt
+            I = self.const_curr
+        elif self._source_mode == "voltage":
             V = self._src_voltage
             if self._load_type == "resistor":
                 I = V / self._R_load

@@ -32,7 +32,7 @@ from pymeasure.experiment import (
 )
 
 # Testing mode, uses dummy driver
-test = False
+test = True
 
 
 def resource_path(relative_path):
@@ -355,14 +355,14 @@ class JVJTProcedure(Procedure):
                 self.sourcemeter.source_voltage = voltage
                 # Measure current
                 #sleep(0.1)
-                self.sourcemeter.write(":INIT")
-                self.sourcemeter.write("*WAI")
-                current = float(self.sourcemeter.ask(":FETCH?"))
-                #current = self.sourcemeter.current
+                #self.sourcemeter.write(":INIT")
+                #self.sourcemeter.write("*WAI")
+                #current = float(self.sourcemeter.ask(":FETCH?"))
+                current = self.sourcemeter.current
                 log.info(f"Measured current: {current:.4e} A")
                 elapsed_time = time.time() - experiment_start_time
                 data = {
-                    "Current JV (A)": current,
+                    "Current JV (A)": 1,
                     "Voltage JV (V)": voltage,
                     "Time JV (S)": elapsed_time,
                     "Current JT (A)": np.nan,  # Use NaN for columns not relevant to this mode
