@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt  # For creating and saving your own plots
 
 # Both the 6430 and 2450 use essentially the same commands, so the 2400 driver works fine
 from pymeasure.instruments.keithley import Keithley2400
-from pymeasure.instruments.keithley import Keithley2450
 from pymeasure.display.Qt import QtWidgets
 from pymeasure.display.windows.managed_dock_window import ManagedDockWindow
 from pymeasure.experiment import Procedure

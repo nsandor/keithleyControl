@@ -32,7 +32,9 @@ import matplotlib
 matplotlib.use("Qt5Agg")  # ensure Qt backend
 matplotlib.set_loglevel("warning")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa: E402
-import matplotlib.pyplot as plt  # noqa: E402 – after backend selection
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+# noqa: E402 – after backend selection
 
 # ----------------------------------------------------------------------
 # Keithley instruments via PyMeasure – with a zero‑volt safety wrapper
@@ -157,7 +159,7 @@ class ScanWorker(QtCore.QObject):
     pixelDone = QtCore.pyqtSignal(int, float)  # pixel index, average current (A)
     finished = QtCore.pyqtSignal()
 
-    def __init__(self, sm, switch, n_samples: int, nplc: float, delay_s: float = 0.05):
+    def __init__(self, sm, switch, n_samples: int, nplc: float, delay_s: float = 0.5):
         super().__init__()
         self._sm = sm
         self._sw = switch
@@ -168,9 +170,13 @@ class ScanWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def run(self):
+        self._sm.reset()
+        self._sm.enable_source()
+        
         # Configure instrument once
         try:
-            self._sm.measure_current(nplc=self._nplc)
+            self._sm.measure_current(nplc=self._nplc,auto_range=False)
+            self._sm.current_range = 1e-7
         except Exception:
             # Dummy – silently ignore
             pass
@@ -188,15 +194,15 @@ class ScanWorker(QtCore.QObject):
             vals = []
             for _ in range(self._n):
                 try:
-                    self._sm.disable_source()
                     val = float(self._sm.current)
+                    QtCore.QThread.msleep(int(self._delay * 1000))
                 except Exception as e:
                     logging.warning(f"Read failed: {e}")
                     val = np.nan
-                vals.append(val)
+                vals.append(np.abs(val))
             avg = float(np.nanmean(vals))
             self.pixelDone.emit(p, avg)
-
+        self._sm.disable_source()
         self.finished.emit()
 
     def stop(self):
@@ -263,7 +269,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.figure = plt.figure(figsize=(5, 5))
         self.ax = self.figure.add_subplot(111)
         # Initial image (blank)
-        self.im = self.ax.imshow(np.zeros((10, 10)), cmap="viridis", vmin=0, vmax=1)
+        self.im = self.ax.imshow(np.zeros((10, 10)), cmap="inferno", norm=LogNorm(vmin=1e-10, vmax=1e-7))
         self.ax.set_xticks([])
         self.ax.set_yticks([])
         self.cbar = self.figure.colorbar(self.im, ax=self.ax, fraction=0.046, pad=0.04,
@@ -325,21 +331,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_heatmap(self, force: bool = False):
         if force:
             # set dummy range until real data arrive
-            self.im.set_data(np.zeros((10, 10)))
-            self.im.set_clim(0, 1)
+            dummy_data = np.zeros((10, 10))
+            self.im.set_data(dummy_data)
+            #self.im.set_clim(0, 1)
             self.canvas.draw_idle()
             return
+    
         # Only update when at least one value is valid
-        if np.all(np.isnan(self.data)):
+        if self.data is None or np.all(np.isnan(self.data)):
             return
-        vmin = float(np.nanmin(self.data))
-        vmax = float(np.nanmax(self.data))
-        if np.isclose(vmin, vmax):
-            vmax = vmin + 1e-12  # avoid zero range
+    
         self.im.set_data(self.data)
-        self.im.set_clim(vmin, vmax)
-        self.cbar.update_normal(self.im)
-        #self.cbar.update_normal(self.im)
+    
         self.canvas.draw_idle()
 
     # -------------------------------------------------- CSV export
@@ -359,7 +362,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------- Hardware connect helpers
     def _connect_sm(self):
         port, ok = QtWidgets.QInputDialog.getText(
-            self, "Sourcemeter", "VISA resource or IP:", text="USB0::0x05E6::0x2400::INSTR"
+            self, "Sourcemeter", "VISA resource or IP:", text="ASRL4::INSTR"
         )
         if not ok or not port:
             return
@@ -369,8 +372,12 @@ class MainWindow(QtWidgets.QMainWindow):
             adapter = (
                 VISAAdapter(port)
                 if port.upper().startswith("USB")
-                else PrologixAdapter(port, 5)
+                else PrologixAdapter(port, 5,gpib_read_timeout=3000)
             )
+            adapter.connection.timeout = 20000
+            adapter.write('++mode 1')         # controller
+            adapter.write('++auto 0')         # *crucial* – we will read explicitly
+            adapter.write('++eoi 1')          # assert EOI with last byte
             self.sm = ReadoutSafe2400(adapter)
             QtWidgets.QMessageBox.information(self, "Sourcemeter", "Connected and locked at 0 V.")
         except Exception as e:
@@ -379,7 +386,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _connect_switch(self):
         port, ok = QtWidgets.QInputDialog.getText(
-            self, "Switch Board", "Serial port:", text="/dev/ttyACM0"
+            self, "Switch Board", "Serial port:", text="COM3"
         )
         if not ok or not port:
             return
