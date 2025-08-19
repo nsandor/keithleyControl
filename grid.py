@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# photodiode_array_live_grid.py  –  2025-07-17 (rev-D)
+# photodiode_array_live_grid.py  –  2025-07-17 (rev-E)
 #
 # Simplified photodiode array readout GUI **WITH HEATMAP + CSV EXPORT**
 # • One Keithley sourcemeter (bias locked to 0 V)
@@ -8,10 +8,13 @@
 # • Displays results as a live‑updating 10 × 10 heat‑map (auto‑scales to current min/max)
 # • Allows exporting the final 10 × 10 array to a CSV file (values in amperes)
 # --- MODIFIED: Added IDN validation, status display, ACK-based sync,
-# ---           bad channel reporting, and heatmap value display.
+# ---           bad channel reporting, and heatmap value display.
 # --- MODIFIED (rev-D): Fixed plot update bug, added separate plot panels,
-# ---                   plot titles, individual plot export, LED control,
-# ---                   and autosave functionality with experiment naming.
+# ---                   plot titles, individual plot export, LED control,
+# ---                   and autosave functionality with experiment naming.
+# --- MODIFIED (rev-E): Reworked plot display to use a selector, added
+# ---                   contextual plot settings, and made device
+# ---                   communication tolerant to disconnections.
 # ----------------------------------------------------------------------
 
 import sys
@@ -310,6 +313,7 @@ class ScanWorker(QtCore.QObject):
     """Runs in a separate thread – performs one full 1→100 scan."""
 
     pixelDone = QtCore.pyqtSignal(int, float)
+    deviceError = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
     def __init__(
@@ -331,13 +335,15 @@ class ScanWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def run(self):
-        self._sm.reset()
-        self._sm.enable_source()
         try:
+            self._sm.reset()
+            self._sm.enable_source()
             self._sm.measure_current(nplc=self._nplc, auto_range=False)
             self._sm.current_range = 1e-7
-        except Exception:
-            pass
+        except Exception as e:
+            self.deviceError.emit(f"Failed to configure Sourcemeter: {e}")
+            self.finished.emit()
+            return
 
         for p in range(1, 101):
             while self._paused and not self._stop:
@@ -349,8 +355,8 @@ class ScanWorker(QtCore.QObject):
                 self._sw.route(p)  # This now blocks until ACK is received
             except Exception as e:
                 logging.warning(f"Switch route failed for pixel {p}: {e}")
-                # Optional: break scan on switch failure
-                # break
+                self.deviceError.emit(f"Switch connection lost: {e}")
+                break
 
             vals = []
             for _ in range(self._n):
@@ -362,13 +368,21 @@ class ScanWorker(QtCore.QObject):
                     QtCore.QThread.msleep(int(self._inter_sample_delay * 1000))
                 except Exception as e:
                     logging.warning(f"Read failed: {e}")
+                    self.deviceError.emit(f"Sourcemeter connection lost: {e}")
                     val = np.nan
+                    break  # Break inner loop
                 vals.append(np.abs(val))
 
-            if self._stop:
+            if self._stop or np.isnan(vals).any():
                 break
+
             self.pixelDone.emit(p, float(np.nanmean(vals)))
-        self._sm.disable_source()
+
+        try:
+            self._sm.disable_source()
+        except Exception:
+            # Ignore errors on shutdown, as device may be disconnected
+            pass
         self.finished.emit()
 
     def pause(self):
@@ -396,20 +410,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- Main Layout: Control Panel | Plot Area ---
         central = QtWidgets.QSplitter()
         self.setCentralWidget(central)
-        ctrl = QtWidgets.QWidget()
-        ctrl_layout = QtWidgets.QFormLayout(ctrl)
-        central.addWidget(ctrl)
+        ctrl_container = QtWidgets.QWidget()
+        ctrl_layout = QtWidgets.QVBoxLayout(ctrl_container)
+        central.addWidget(ctrl_container)
 
         # --- Control Panel ---
+        scan_settings_box = QtWidgets.QGroupBox("Scan Settings")
+        scan_settings_layout = QtWidgets.QFormLayout(scan_settings_box)
         self.spin_nplc = QtWidgets.QDoubleSpinBox()
         self.spin_nplc.setDecimals(2)
         self.spin_nplc.setRange(0.01, 25)
         self.spin_nplc.setValue(1.0)
-        ctrl_layout.addRow("NPLC", self.spin_nplc)
+        scan_settings_layout.addRow("NPLC", self.spin_nplc)
         self.spin_nsamp = QtWidgets.QSpinBox()
         self.spin_nsamp.setRange(1, 100)
         self.spin_nsamp.setValue(5)
-        ctrl_layout.addRow("Samples / pixel", self.spin_nsamp)
+        scan_settings_layout.addRow("Samples / pixel", self.spin_nsamp)
+        ctrl_layout.addWidget(scan_settings_box)
 
         self.btn_run_abort = QtWidgets.QPushButton("Run Scan")
         self.btn_pause_resume = QtWidgets.QPushButton("Pause")
@@ -417,12 +434,14 @@ class MainWindow(QtWidgets.QMainWindow):
         run_layout = QtWidgets.QHBoxLayout()
         run_layout.addWidget(self.btn_run_abort)
         run_layout.addWidget(self.btn_pause_resume)
-        ctrl_layout.addRow(run_layout)
+        ctrl_layout.addLayout(run_layout)
 
-        self.btn_export = QtWidgets.QPushButton("Export CSV…")
+        self.btn_export = QtWidgets.QPushButton("Export All Data (CSV)…")
         self.btn_export.setEnabled(False)
-        ctrl_layout.addRow(self.btn_export)
+        ctrl_layout.addWidget(self.btn_export)
 
+        hw_box = QtWidgets.QGroupBox("Hardware Control")
+        hw_layout = QtWidgets.QVBoxLayout(hw_box)
         h_hw = QtWidgets.QHBoxLayout()
         self.btn_connect_sm = QtWidgets.QPushButton("Connect SM…")
         self.btn_connect_sw = QtWidgets.QPushButton("Connect Switch…")
@@ -432,22 +451,21 @@ class MainWindow(QtWidgets.QMainWindow):
         h_hw.addWidget(self.btn_connect_sm)
         h_hw.addWidget(self.btn_connect_sw)
         h_hw.addWidget(self.btn_leds)
-        ctrl_layout.addRow(h_hw)
-
+        hw_layout.addLayout(h_hw)
         status_box = QtWidgets.QGroupBox("Instrument Status")
         status_layout = QtWidgets.QVBoxLayout(status_box)
         self.status_text = QtWidgets.QTextEdit()
         self.status_text.setReadOnly(True)
         self.status_text.setFixedHeight(60)
         status_layout.addWidget(self.status_text)
-        ctrl_layout.addRow(status_box)
-
+        hw_layout.addWidget(status_box)
         sw_status_box = QtWidgets.QGroupBox("Inactive Switch Channels")
         sw_status_layout = QtWidgets.QVBoxLayout(sw_status_box)
         self.inactive_channels_display = QtWidgets.QLineEdit()
         self.inactive_channels_display.setReadOnly(True)
         sw_status_layout.addWidget(self.inactive_channels_display)
-        ctrl_layout.addRow(sw_status_box)
+        hw_layout.addWidget(sw_status_box)
+        ctrl_layout.addWidget(hw_box)
 
         # --- Output & Saving Controls ---
         save_box = QtWidgets.QGroupBox("Output & Saving")
@@ -465,60 +483,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.check_autosave = QtWidgets.QCheckBox("Autosave after scan")
         self.check_autosave.setChecked(True)
         save_layout.addRow(self.check_autosave)
-        ctrl_layout.addRow(save_box)
+        ctrl_layout.addWidget(save_box)
 
-        # --- Plotting Controls ---
-        plot_box = QtWidgets.QGroupBox("Plot Settings")
-        plot_layout = QtWidgets.QFormLayout(plot_box)
-        self.edit_heatmap_title = QtWidgets.QLineEdit("Photodiode Current")
-        plot_layout.addRow("Heatmap Title:", self.edit_heatmap_title)
-        self.edit_hist_title = QtWidgets.QLineEdit("Current Distribution")
-        plot_layout.addRow("Histogram Title:", self.edit_hist_title)
-        self.combo_colormap = QtWidgets.QComboBox()
-        self.colormaps = [
-            "inferno",
-            "viridis",
-            "plasma",
-            "magma",
-            "cividis",
-            "gray_r",
-            "jet",
-        ]
-        self.combo_colormap.addItems(self.colormaps)
-        plot_layout.addRow("Colormap:", self.combo_colormap)
-        self.check_log_scale = QtWidgets.QCheckBox("Logarithmic Scale")
-        self.check_log_scale.setChecked(True)
-        plot_layout.addRow(self.check_log_scale)
-        self.check_auto_scale = QtWidgets.QCheckBox("Auto-scale Color Limit")
-        self.check_auto_scale.setChecked(True)
-        plot_layout.addRow(self.check_auto_scale)
-        self.edit_vmin = QtWidgets.QLineEdit("1e-10")
-        self.edit_vmax = QtWidgets.QLineEdit("1e-7")
-        self.edit_vmin.setEnabled(False)
-        self.edit_vmax.setEnabled(False)
-        minmax_layout = QtWidgets.QHBoxLayout()
-        minmax_layout.addWidget(QtWidgets.QLabel("Min:"))
-        minmax_layout.addWidget(self.edit_vmin)
-        minmax_layout.addWidget(QtWidgets.QLabel("Max:"))
-        minmax_layout.addWidget(self.edit_vmax)
-        plot_layout.addRow("Manual Limits:", minmax_layout)
-        self.check_show_values = QtWidgets.QCheckBox("Show Pixel Values")
-        plot_layout.addRow(self.check_show_values)
-        self.btn_export_heatmap = QtWidgets.QPushButton("Export Heatmap PNG…")
-        self.btn_export_hist = QtWidgets.QPushButton("Export Histogram PNG…")
-        h_export_plots = QtWidgets.QHBoxLayout()
-        h_export_plots.addWidget(self.btn_export_heatmap)
-        h_export_plots.addWidget(self.btn_export_hist)
-        plot_layout.addRow(h_export_plots)
-        ctrl_layout.addRow(plot_box)
-        ctrl_layout.addItem(
-            QtWidgets.QSpacerItem(
-                0, 0, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding
-            )
-        )
+        # --- Plotting Controls (in a Stacked Widget) ---
+        self.plot_settings_stack = QtWidgets.QStackedWidget()
+        self._create_heatmap_settings_panel()
+        self._create_histogram_settings_panel()
+        ctrl_layout.addWidget(self.plot_settings_stack)
 
-        # --- Plot Area: Vertical splitter for Heatmap and Histogram ---
-        plot_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        ctrl_layout.addStretch(1)
+
+        # --- Plot Area: Selector + Stacked Widget ---
+        plot_area_widget = QtWidgets.QWidget()
+        plot_area_layout = QtWidgets.QVBoxLayout(plot_area_widget)
+        self.plot_selector = QtWidgets.QComboBox()
+        self.plot_selector.addItems(["Heatmap", "Histogram"])
+        plot_area_layout.addWidget(self.plot_selector)
+
+        self.plot_stack = QtWidgets.QStackedWidget()
+        plot_area_layout.addWidget(self.plot_stack)
 
         # Heatmap Figure
         self.figure_heatmap = plt.figure()
@@ -535,7 +518,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.im, ax=self.ax_heatmap, fraction=0.046, pad=0.04, label="Current (A)"
         )
         self.figure_heatmap.tight_layout(pad=2.5)
-        plot_splitter.addWidget(self.canvas_heatmap)
+        self.plot_stack.addWidget(self.canvas_heatmap)
 
         # Histogram Figure
         self.figure_hist = plt.figure()
@@ -545,9 +528,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ax_hist.set_ylabel("Pixel Count")
         self.ax_hist.grid(True, linestyle="--", alpha=0.6)
         self.figure_hist.tight_layout(pad=2.5)
-        plot_splitter.addWidget(self.canvas_hist)
+        self.plot_stack.addWidget(self.canvas_hist)
 
-        central.addWidget(plot_splitter)
+        central.addWidget(plot_area_widget)
         central.setStretchFactor(1, 1)
 
         # --- Connections ---
@@ -558,18 +541,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_connect_sw.clicked.connect(self._connect_switch)
         self.btn_leds.toggled.connect(self._on_led_toggled)
         self.btn_browse_folder.clicked.connect(self._select_output_folder)
-        self.btn_export_heatmap.clicked.connect(self._export_heatmap)
-        self.btn_export_hist.clicked.connect(self._export_histogram)
-
-        # --- FIX: Use partial to prevent signals from passing unwanted args to _update_plots ---
-        self.edit_heatmap_title.editingFinished.connect(partial(self._update_plots))
-        self.edit_hist_title.editingFinished.connect(partial(self._update_plots))
-        self.combo_colormap.currentIndexChanged.connect(partial(self._update_plots))
-        self.check_log_scale.stateChanged.connect(partial(self._update_plots))
-        self.check_show_values.stateChanged.connect(partial(self._update_plots))
-        self.edit_vmin.editingFinished.connect(partial(self._update_plots))
-        self.edit_vmax.editingFinished.connect(partial(self._update_plots))
-        self.check_auto_scale.toggled.connect(self._update_plot_controls_state)
+        self.plot_selector.currentIndexChanged.connect(self._on_plot_selected)
 
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[ScanWorker] = None
@@ -580,7 +552,82 @@ class MainWindow(QtWidgets.QMainWindow):
         self.value_text_annotations: List = []
         self.bad_channel_markers = None
         self._update_status_text()
+        self._on_plot_selected(0)  # Initialize to heatmap view
         self._update_plots()
+
+    def _create_heatmap_settings_panel(self):
+        plot_box = QtWidgets.QGroupBox("Heatmap Settings")
+        plot_layout = QtWidgets.QFormLayout(plot_box)
+        self.edit_heatmap_title = QtWidgets.QLineEdit("Photodiode Current")
+        plot_layout.addRow("Title:", self.edit_heatmap_title)
+        self.combo_colormap = QtWidgets.QComboBox()
+        self.colormaps = [
+            "inferno",
+            "viridis",
+            "plasma",
+            "magma",
+            "cividis",
+            "gray_r",
+            "jet",
+        ]
+        self.combo_colormap.addItems(self.colormaps)
+        plot_layout.addRow("Colormap:", self.combo_colormap)
+        self.check_log_scale_heatmap = QtWidgets.QCheckBox("Logarithmic Color Scale")
+        self.check_log_scale_heatmap.setChecked(True)
+        plot_layout.addRow(self.check_log_scale_heatmap)
+        self.check_auto_scale = QtWidgets.QCheckBox("Auto-scale Color Limit")
+        self.check_auto_scale.setChecked(True)
+        plot_layout.addRow(self.check_auto_scale)
+        self.edit_vmin = QtWidgets.QLineEdit("1e-10")
+        self.edit_vmax = QtWidgets.QLineEdit("1e-7")
+        self.edit_vmin.setEnabled(False)
+        self.edit_vmax.setEnabled(False)
+        minmax_layout = QtWidgets.QHBoxLayout()
+        minmax_layout.addWidget(QtWidgets.QLabel("Min:"))
+        minmax_layout.addWidget(self.edit_vmin)
+        minmax_layout.addWidget(QtWidgets.QLabel("Max:"))
+        minmax_layout.addWidget(self.edit_vmax)
+        plot_layout.addRow("Manual Limits:", minmax_layout)
+        self.check_show_values = QtWidgets.QCheckBox("Show Pixel Values")
+        plot_layout.addRow(self.check_show_values)
+        self.btn_export_heatmap = QtWidgets.QPushButton("Export Heatmap PNG…")
+        plot_layout.addRow(self.btn_export_heatmap)
+        self.plot_settings_stack.addWidget(plot_box)
+
+        # Connections
+        self.edit_heatmap_title.editingFinished.connect(partial(self._update_plots))
+        self.combo_colormap.currentIndexChanged.connect(partial(self._update_plots))
+        self.check_log_scale_heatmap.stateChanged.connect(partial(self._update_plots))
+        self.check_show_values.stateChanged.connect(partial(self._update_plots))
+        self.edit_vmin.editingFinished.connect(partial(self._update_plots))
+        self.edit_vmax.editingFinished.connect(partial(self._update_plots))
+        self.check_auto_scale.toggled.connect(self._update_plot_controls_state)
+        self.btn_export_heatmap.clicked.connect(self._export_heatmap)
+
+    def _create_histogram_settings_panel(self):
+        hist_box = QtWidgets.QGroupBox("Histogram Settings")
+        hist_layout = QtWidgets.QFormLayout(hist_box)
+        self.edit_hist_title = QtWidgets.QLineEdit("Current Distribution")
+        hist_layout.addRow("Title:", self.edit_hist_title)
+        self.spin_bins = QtWidgets.QSpinBox()
+        self.spin_bins.setRange(5, 200)
+        self.spin_bins.setValue(25)
+        hist_layout.addRow("Number of Bins:", self.spin_bins)
+        self.check_log_scale_hist = QtWidgets.QCheckBox("Logarithmic Y-Axis")
+        hist_layout.addRow(self.check_log_scale_hist)
+        self.btn_export_hist = QtWidgets.QPushButton("Export Histogram PNG…")
+        hist_layout.addRow(self.btn_export_hist)
+        self.plot_settings_stack.addWidget(hist_box)
+
+        # Connections
+        self.edit_hist_title.editingFinished.connect(partial(self._update_plots))
+        self.spin_bins.valueChanged.connect(partial(self._update_plots))
+        self.check_log_scale_hist.stateChanged.connect(partial(self._update_plots))
+        self.btn_export_hist.clicked.connect(self._export_histogram)
+
+    def _on_plot_selected(self, index: int):
+        self.plot_stack.setCurrentIndex(index)
+        self.plot_settings_stack.setCurrentIndex(index)
 
     def on_run_abort_clicked(self):
         if self._thread is not None:
@@ -611,6 +658,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread = QtCore.QThread()
         self._worker.moveToThread(self._thread)
         self._worker.pixelDone.connect(self._update_pixel)
+        self._worker.deviceError.connect(self._handle_device_error)
         self._worker.finished.connect(self._scan_finished)
         self._thread.started.connect(self._worker.run)
         self.btn_run_abort.setText("Abort")
@@ -637,7 +685,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_export.setEnabled(True)
         self._thread = None
         self._worker = None
-        self._autosave_results()
+        if not np.all(np.isnan(self.data)):  # Only autosave if some data was collected
+            self._autosave_results()
+
+    def _handle_device_error(self, message: str):
+        logging.error(f"Device error during scan: {message}")
+        # Stop the worker. The finished signal will call _scan_finished for cleanup.
+        if self._worker:
+            self._worker.stop()
+
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Device Error",
+            f"A device has disconnected or failed.\n\n{message}\n\nThe scan has been aborted.",
+        )
+
+        # Reset the specific device that failed
+        if "switch" in message.lower():
+            self.switch = DummySwitchBoard()
+            self.switch_idn = "Switch: (disconnected)"
+            self.btn_connect_sw.setStyleSheet("")
+            self.btn_leds.setEnabled(False)
+        if "sourcemeter" in message.lower():
+            self.sm = DummyKeithley2400()
+            self.sm_idn = "Sourcemeter: (disconnected)"
+            self.btn_connect_sm.setStyleSheet("")
+
+        self._update_status_text()
 
     def _update_pixel(self, idx: int, i_avg: float):
         r, c = divmod(idx - 1, 10)
@@ -645,9 +719,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_plots()
 
     def _update_plots(self, reset: bool = False):
+        # --- Update Heatmap Data ---
         self.ax_heatmap.set_title(self.edit_heatmap_title.text())
-        self.ax_hist.set_title(self.edit_hist_title.text())
-
         for txt in self.value_text_annotations:
             txt.remove()
         self.value_text_annotations.clear()
@@ -657,22 +730,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if reset:
             self.im.set_data(np.full((10, 10), np.nan))
-            self.ax_hist.clear()
-            self.ax_hist.grid(True, linestyle="--", alpha=0.6)
         else:
             valid_data = self.data[~np.isnan(self.data)]
             if valid_data.size == 0:
                 self.im.set_data(np.full((10, 10), np.nan))
             else:
                 self.im.set_data(self.data)
-                use_log = self.check_log_scale.isChecked()
+                use_log = self.check_log_scale_heatmap.isChecked()
                 if self.check_auto_scale.isChecked():
                     vmin, vmax = np.nanmin(valid_data), np.nanmax(valid_data)
                     if vmin == vmax:
                         vmin = max(1e-12, vmin * 0.9)
                         vmax = max(1e-12, vmax * 1.1)
-                    if vmin == 0 and use_log:
-                        vmin = 1e-12
+                    if vmin <= 0 and use_log:
+                        vmin = 1e-12  # Log scale can't handle zero or negative
                     self.edit_vmin.setText(f"{vmin:.3e}")
                     self.edit_vmax.setText(f"{vmax:.3e}")
                 else:
@@ -711,15 +782,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                     )
                                 )
 
-            self.ax_hist.clear()
-            if valid_data.size > 0:
-                self.ax_hist.hist(valid_data.flatten(), bins=25, color="gray")
-                if self.check_log_scale.isChecked():
-                    self.ax_hist.set_yscale("log")
-            self.ax_hist.grid(True, linestyle="--", alpha=0.6)
-
-        self.ax_hist.set_xlabel("Current (A)")
-        self.ax_hist.set_ylabel("Pixel Count")
         if self.inactive_channels:
             rows, cols = divmod(np.array(self.inactive_channels) - 1, 10)
             self.bad_channel_markers = self.ax_heatmap.scatter(
@@ -728,6 +790,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.figure_heatmap.tight_layout(pad=2.5)
         self.canvas_heatmap.draw_idle()
+
+        # --- Update Histogram Data ---
+        self.ax_hist.clear()
+        self.ax_hist.set_title(self.edit_hist_title.text())
+        valid_data = self.data[~np.isnan(self.data)]
+        if valid_data.size > 0:
+            self.ax_hist.hist(
+                valid_data.flatten(), bins=self.spin_bins.value(), color="gray"
+            )
+        if self.check_log_scale_hist.isChecked():
+            self.ax_hist.set_yscale("log")
+        self.ax_hist.grid(True, linestyle="--", alpha=0.6)
+        self.ax_hist.set_xlabel("Current (A)")
+        self.ax_hist.set_ylabel("Pixel Count")
+
         self.figure_hist.tight_layout(pad=2.5)
         self.canvas_hist.draw_idle()
 
