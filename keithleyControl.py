@@ -1,39 +1,41 @@
+import os  # Import the os module
+import sys
+import time  # Import the time module
+from time import sleep
+
+# -- Force a non‐GUI backend before importing pyplot --
+import matplotlib
+import numpy as np
+from pymeasure.adapters import PrologixAdapter, VISAAdapter
+from pymeasure.log import log
+from PyQt5.QtGui import QIcon  # Add this import
+
+from drivers.dummy_keithley import DummyKeithley2400
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # For creating and saving your own plots
+from pymeasure.display.Qt import QtWidgets
+from pymeasure.display.windows.managed_dock_window import ManagedDockWindow
+from pymeasure.experiment import (
+    BooleanParameter,
+    FloatParameter,
+    IntegerParameter,
+    ListParameter,
+    Metadata,
+    Parameter,
+    Procedure,
+)
+
+# Both the 6430 and 2450 use essentially the same commands, so the 2400 driver works fine
+from pymeasure.instruments.keithley import Keithley2400
+
+# Testing mode, uses dummy driver
+test = True
+
 import logging
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
-import numpy as np
-import sys
-import os  # Import the os module
-import time  # Import the time module
-from time import sleep
-from pymeasure.log import log
-from pymeasure.adapters import VISAAdapter, PrologixAdapter
-from drivers.dummy_keithley import DummyKeithley2400
-from PyQt5.QtGui import QIcon  # Add this import
-
-# -- Force a non‐GUI backend before importing pyplot --
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # For creating and saving your own plots
-
-# Both the 6430 and 2450 use essentially the same commands, so the 2400 driver works fine
-from pymeasure.instruments.keithley import Keithley2400
-from pymeasure.display.Qt import QtWidgets
-from pymeasure.display.windows.managed_dock_window import ManagedDockWindow
-from pymeasure.experiment import Procedure
-from pymeasure.experiment import (
-    Parameter,
-    IntegerParameter,
-    FloatParameter,
-    ListParameter,
-    BooleanParameter,
-    Metadata,
-)
-
-# Testing mode, uses dummy driver
-test = True
 
 
 def resource_path(relative_path):
@@ -349,7 +351,7 @@ class JVJTProcedure(Procedure):
                 last_step_start_time = time.time()
 
                 log.info(
-                    f"Step {count+1}/{total_steps}: Setting voltage to {voltage:.4f} V"
+                    f"Step {count + 1}/{total_steps}: Setting voltage to {voltage:.4f} V"
                 )
                 self.sourcemeter.source_voltage = voltage
                 # Measure current
@@ -523,7 +525,6 @@ class JVJTProcedure(Procedure):
 
 
 class MainWindow(ManagedDockWindow):
-
     def __init__(self):
         super().__init__(
             procedure_class=JVJTProcedure,

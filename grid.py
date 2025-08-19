@@ -862,6 +862,9 @@ class MainWindow(QtWidgets.QMainWindow):
             ident = self.sm.adapter.ask("*IDN?")
             if not (ident and len(ident) > 3):
                 raise RuntimeError("Device did not respond to *IDN?")
+            if use_visa:
+                self.sm.use_rear_terminals()
+                # means we are using the 2400, make sure to use the back panel
 
             self.sm_idn = f"Sourcemeter: {ident.strip()}"
             self._update_status_text()
