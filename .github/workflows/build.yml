@@ -39,6 +39,7 @@ jobs:
         run: |
           pyinstaller `
           --windowed `
+          --onedir `
           --icon="res/icons/FireGrid.png" `
           grid.py
         shell: pwsh

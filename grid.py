@@ -1145,8 +1145,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    
+    SplashScreen = QtWidgets.QSplashScreen(QtGui.QPixmap("res/icons/FireGrid.png"))
+    SplashScreen.show()
     win = MainWindow()
     win.show()
+    SplashScreen.finish(win)
     sys.exit(app.exec_())
 
 
