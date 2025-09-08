@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-# photodiode_array_live_grid.py  –  2025-07-17 (rev-E)
+# photodiode_array_live_grid.py  –  2025-09-08 (rev-F)
 #
-# Simplified photodiode array readout GUI **WITH HEATMAP + CSV EXPORT**
-# • One Keithley sourcemeter (bias locked to 0 V)
+# Photodiode array readout GUI **WITH HEATMAP + CSV EXPORT**
+# • One Keithley sourcemeter (bias locked to 0 V)
 # • USB 100:1 switch (Nano Every firmware v1.0) – or Dummy for offline testing
-# • Reads the average current over N samples for each of the 100 pixels (single‑shot)
-# • Displays results as a live‑updating 10 × 10 heat‑map (auto‑scales to current min/max)
-# • Allows exporting the final 10 × 10 array to a CSV file (values in amperes)
-# --- MODIFIED: Added IDN validation, status display, ACK-based sync,
-# ---           bad channel reporting, and heatmap value display.
-# --- MODIFIED (rev-D): Fixed plot update bug, added separate plot panels,
-# ---                   plot titles, individual plot export, LED control,
-# ---                   and autosave functionality with experiment naming.
-# --- MODIFIED (rev-E): Reworked plot display to use a selector, added
-# ---                   contextual plot settings, and made device
-# ---                   communication tolerant to disconnections.
+# • Reads average current over N samples for selected pixels (single‑shot per loop)
+# • Displays a live 10×10 heat‑map (auto/manual scaling)
+# • Exports CSV per loop + optional summary exports at end
+# --- NEW (rev‑F):
+#     • Pixel subset selection (e.g., "50-70, 1, 10-12")
+#     • Multi‑loop execution with CSV after each loop (loop_###.csv)
+#     • Manual current range option (disable auto‑range and set range)
+# --- PREV (rev‑E): selector for plots, contextual settings, disconnection‑tolerant I/O
+#
+# NOTE: PyMeasure, PyQt5/PySide6, matplotlib, and pyserial are required.
 # ----------------------------------------------------------------------
 
 import sys
 import time
 import logging
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Iterable
 from functools import partial
 
 import numpy as np
@@ -58,8 +57,6 @@ from matplotlib.backends.backend_qt5agg import (
 )  # noqa: E402
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
-
-# noqa: E402 – after backend selection
 
 # ----------------------------------------------------------------------
 # Keithley instruments via PyMeasure – with a zero‑volt safety wrapper
@@ -229,7 +226,7 @@ class _DevicePickDialog(QtWidgets.QDialog):
 
 
 class ReadoutSafe2400(Keithley2400):
-    """Keithley 24xx that *must* remain at 0 V source output."""
+    """Keithley 24xx that *must* remain at 0 V source output."""
 
     def __init__(self, adapter, **kwargs):
         super().__init__(adapter, **kwargs)
@@ -244,12 +241,12 @@ class ReadoutSafe2400(Keithley2400):
     @source_voltage.setter
     def source_voltage(self, val):
         if abs(val) > 1e-9:
-            raise RuntimeError("Readout SM must remain at 0 V – refusing")
+            raise RuntimeError("Readout SM must remain at 0 V – refusing")
         super(ReadoutSafe2400, self.__class__).source_voltage.fset(self, 0)
 
     def enable_source(self):
         if abs(self.source_voltage) > 1e-9:
-            raise RuntimeError("Refusing to enable source – voltage ≠ 0 V")
+            raise RuntimeError("Refusing to enable source – voltage ≠ 0 V")
         super().enable_source()
 
 
@@ -285,6 +282,8 @@ class SwitchBoard:
     """Simple wrapper for the 100:1 switch USB board, with ACK sync."""
 
     def __init__(self, port: str, baud: int = 9600, timeout: float = 2.0):
+        if serial is None:
+            raise RuntimeError("pyserial not available")
         self.ser = serial.Serial(port, baudrate=baud, timeout=timeout)
 
     def route(self, idx: int):
@@ -310,9 +309,11 @@ class DummySwitchBoard:
 
 
 class ScanWorker(QtCore.QObject):
-    """Runs in a separate thread – performs one full 1→100 scan."""
+    """Runs in a separate thread – performs N loops over selected pixels."""
 
-    pixelDone = QtCore.pyqtSignal(int, float)
+    pixelDone = QtCore.pyqtSignal(int, float)          # (pixel_index, avg_current)
+    loopStarted = QtCore.pyqtSignal(int)               # loop index starting at 1
+    loopFinished = QtCore.pyqtSignal(int)              # loop index finished
     deviceError = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
@@ -322,6 +323,10 @@ class ScanWorker(QtCore.QObject):
         switch,
         n_samples: int,
         nplc: float,
+        pixel_indices: Optional[Iterable[int]] = None,
+        loops: int = 1,
+        auto_range: bool = True,
+        current_range: float = 1e-7,
         inter_sample_delay_s: float = 0.05,
     ):
         super().__init__()
@@ -329,61 +334,86 @@ class ScanWorker(QtCore.QObject):
         self._sw = switch
         self._n = max(1, n_samples)
         self._nplc = max(0.01, nplc)
+        self._pixels = list(pixel_indices) if pixel_indices else list(range(1, 101))
+        self._loops = max(1, int(loops))
+        self._auto_range = bool(auto_range)
+        self._current_range = float(current_range)
         self._inter_sample_delay = inter_sample_delay_s
         self._stop = False
         self._paused = False
 
     @QtCore.pyqtSlot()
     def run(self):
+        # Configure SM once at start; re‑use across loops
         try:
             self._sm.reset()
             self._sm.enable_source()
-            self._sm.measure_current(nplc=self._nplc, auto_range=False)
-            self._sm.current_range = 1e-7
+            try:
+                # Prefer API with explicit auto_range kwarg if available
+                self._sm.measure_current(nplc=self._nplc, auto_range=self._auto_range)
+            except TypeError:
+                # Older PyMeasure versions
+                self._sm.measure_current(nplc=self._nplc)
+            # Apply manual range if requested
+            if not self._auto_range:
+                try:
+                    self._sm.current_range = self._current_range
+                except Exception:
+                    pass
         except Exception as e:
             self.deviceError.emit(f"Failed to configure Sourcemeter: {e}")
             self.finished.emit()
             return
 
-        for p in range(1, 101):
-            while self._paused and not self._stop:
-                QtCore.QThread.msleep(100)
-            if self._stop:
-                break
-
-            try:
-                self._sw.route(p)  # This now blocks until ACK is received
-            except Exception as e:
-                logging.warning(f"Switch route failed for pixel {p}: {e}")
-                self.deviceError.emit(f"Switch connection lost: {e}")
-                break
-
-            vals = []
-            for _ in range(self._n):
+        try:
+            for loop_idx in range(1, self._loops + 1):
                 if self._stop:
                     break
-                try:
-                    val = float(self._sm.current)
-                    # This delay is for measurement settling, not switching
-                    QtCore.QThread.msleep(int(self._inter_sample_delay * 1000))
-                except Exception as e:
-                    logging.warning(f"Read failed: {e}")
-                    self.deviceError.emit(f"Sourcemeter connection lost: {e}")
-                    val = np.nan
-                    break  # Break inner loop
-                vals.append(np.abs(val))
+                self.loopStarted.emit(loop_idx)
 
-            if self._stop or np.isnan(vals).any():
-                break
+                for p in self._pixels:
+                    while self._paused and not self._stop:
+                        QtCore.QThread.msleep(100)
+                    if self._stop:
+                        break
 
-            self.pixelDone.emit(p, float(np.nanmean(vals)))
+                    try:
+                        self._sw.route(p)  # blocks until ACK
+                    except Exception as e:
+                        logging.warning(f"Switch route failed for pixel {p}: {e}")
+                        self.deviceError.emit(f"Switch connection lost: {e}")
+                        raise  # bail out to cleanup
 
-        try:
-            self._sm.disable_source()
+                    vals = []
+                    for _ in range(self._n):
+                        if self._stop:
+                            break
+                        try:
+                            val = float(self._sm.current)
+                            QtCore.QThread.msleep(int(self._inter_sample_delay * 1000))
+                        except Exception as e:
+                            logging.warning(f"Read failed: {e}")
+                            self.deviceError.emit(f"Sourcemeter connection lost: {e}")
+                            raise
+                        vals.append(abs(val))
+
+                    if self._stop:
+                        break
+
+                    self.pixelDone.emit(p, float(np.mean(vals)))
+
+                if self._stop:
+                    break
+                self.loopFinished.emit(loop_idx)
         except Exception:
-            # Ignore errors on shutdown, as device may be disconnected
+            # prior deviceError signal carries the reason
             pass
-        self.finished.emit()
+        finally:
+            try:
+                self._sm.disable_source()
+            except Exception:
+                pass
+            self.finished.emit()
 
     def pause(self):
         self._paused = True
@@ -399,13 +429,14 @@ class ScanWorker(QtCore.QObject):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Photodiode Array – Live Current Heat-map")
-        self.resize(1000, 850)
+        self.setWindowTitle("Photodiode Array – Live Current Heat‑map")
+        self.resize(1060, 880)
         self.setStatusBar(QtWidgets.QStatusBar(self))
 
         self.data = np.full((10, 10), np.nan)
         self.sm: Optional[Keithley2400] = DummyKeithley2400()
         self.switch: Optional[SwitchBoard] = DummySwitchBoard()
+        self._run_folder: Optional[Path] = None
 
         # --- Main Layout: Control Panel | Plot Area ---
         central = QtWidgets.QSplitter()
@@ -414,20 +445,48 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_layout = QtWidgets.QVBoxLayout(ctrl_container)
         central.addWidget(ctrl_container)
 
-        # --- Control Panel ---
+        # --- Scan Settings ---
         scan_settings_box = QtWidgets.QGroupBox("Scan Settings")
         scan_settings_layout = QtWidgets.QFormLayout(scan_settings_box)
+
+        self.edit_pixel_spec = QtWidgets.QLineEdit("1-100")
+        self.edit_pixel_spec.setPlaceholderText("Ranges and indices, e.g., 50-70, 1, 10-12")
+        scan_settings_layout.addRow("Pixels to scan:", self.edit_pixel_spec)
+
+        self.spin_loops = QtWidgets.QSpinBox()
+        self.spin_loops.setRange(1, 100000)
+        self.spin_loops.setValue(1)
+        scan_settings_layout.addRow("Loops:", self.spin_loops)
+
         self.spin_nplc = QtWidgets.QDoubleSpinBox()
         self.spin_nplc.setDecimals(2)
         self.spin_nplc.setRange(0.01, 25)
         self.spin_nplc.setValue(1.0)
-        scan_settings_layout.addRow("NPLC", self.spin_nplc)
+        scan_settings_layout.addRow("NPLC:", self.spin_nplc)
+
         self.spin_nsamp = QtWidgets.QSpinBox()
         self.spin_nsamp.setRange(1, 100)
         self.spin_nsamp.setValue(5)
-        scan_settings_layout.addRow("Samples / pixel", self.spin_nsamp)
+        scan_settings_layout.addRow("Samples / pixel:", self.spin_nsamp)
+
+        # Manual current range controls
+        self.check_auto_current_range = QtWidgets.QCheckBox("Auto current range")
+        self.check_auto_current_range.setChecked(True)
+        self.edit_current_range = QtWidgets.QLineEdit("1e-7")
+        self.edit_current_range.setEnabled(False)
+        cur_rng_row = QtWidgets.QHBoxLayout()
+        cur_rng_row.addWidget(self.check_auto_current_range)
+        cur_rng_row.addStretch(1)
+        scan_settings_layout.addRow(cur_rng_row)
+        scan_settings_layout.addRow("Manual range (A):", self.edit_current_range)
+
+        self.check_auto_current_range.toggled.connect(
+            lambda b: self.edit_current_range.setEnabled(not b)
+        )
+
         ctrl_layout.addWidget(scan_settings_box)
 
+        # Run controls
         self.btn_run_abort = QtWidgets.QPushButton("Run Scan")
         self.btn_pause_resume = QtWidgets.QPushButton("Pause")
         self.btn_pause_resume.setEnabled(False)
@@ -436,10 +495,11 @@ class MainWindow(QtWidgets.QMainWindow):
         run_layout.addWidget(self.btn_pause_resume)
         ctrl_layout.addLayout(run_layout)
 
-        self.btn_export = QtWidgets.QPushButton("Export All Data (CSV)…")
+        self.btn_export = QtWidgets.QPushButton("Export Current Data (CSV)…")
         self.btn_export.setEnabled(False)
         ctrl_layout.addWidget(self.btn_export)
 
+        # --- Hardware Control ---
         hw_box = QtWidgets.QGroupBox("Hardware Control")
         hw_layout = QtWidgets.QVBoxLayout(hw_box)
         h_hw = QtWidgets.QHBoxLayout()
@@ -467,7 +527,7 @@ class MainWindow(QtWidgets.QMainWindow):
         hw_layout.addWidget(sw_status_box)
         ctrl_layout.addWidget(hw_box)
 
-        # --- Output & Saving Controls ---
+        # --- Output & Saving ---
         save_box = QtWidgets.QGroupBox("Output & Saving")
         save_layout = QtWidgets.QFormLayout(save_box)
         self.edit_exp_name = QtWidgets.QLineEdit("MyExperiment")
@@ -480,7 +540,7 @@ class MainWindow(QtWidgets.QMainWindow):
         h_folder.addWidget(self.btn_browse_folder)
         save_layout.addRow("Output Folder:", h_folder)
         self.output_folder = Path(self.edit_output_folder.text())
-        self.check_autosave = QtWidgets.QCheckBox("Autosave after scan")
+        self.check_autosave = QtWidgets.QCheckBox("Also write summary heatmap + histogram at end")
         self.check_autosave.setChecked(True)
         save_layout.addRow(self.check_autosave)
         ctrl_layout.addWidget(save_box)
@@ -536,7 +596,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- Connections ---
         self.btn_run_abort.clicked.connect(self.on_run_abort_clicked)
         self.btn_pause_resume.clicked.connect(self.on_pause_resume_clicked)
-        self.btn_export.clicked.connect(self._export_csv)
+        self.btn_export.clicked.connect(self._export_csv_once)
         self.btn_connect_sm.clicked.connect(self._connect_sm)
         self.btn_connect_sw.clicked.connect(self._connect_switch)
         self.btn_leds.toggled.connect(self._on_led_toggled)
@@ -555,6 +615,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._on_plot_selected(0)  # Initialize to heatmap view
         self._update_plots()
 
+    # ---------- UI panels ----------
     def _create_heatmap_settings_panel(self):
         plot_box = QtWidgets.QGroupBox("Heatmap Settings")
         plot_layout = QtWidgets.QFormLayout(plot_box)
@@ -575,7 +636,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.check_log_scale_heatmap = QtWidgets.QCheckBox("Logarithmic Color Scale")
         self.check_log_scale_heatmap.setChecked(True)
         plot_layout.addRow(self.check_log_scale_heatmap)
-        self.check_auto_scale = QtWidgets.QCheckBox("Auto-scale Color Limit")
+        self.check_auto_scale = QtWidgets.QCheckBox("Auto‑scale Color Limit")
         self.check_auto_scale.setChecked(True)
         plot_layout.addRow(self.check_auto_scale)
         self.edit_vmin = QtWidgets.QLineEdit("1e-10")
@@ -613,7 +674,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_bins.setRange(5, 200)
         self.spin_bins.setValue(25)
         hist_layout.addRow("Number of Bins:", self.spin_bins)
-        self.check_log_scale_hist = QtWidgets.QCheckBox("Logarithmic Y-Axis")
+        self.check_log_scale_hist = QtWidgets.QCheckBox("Logarithmic Y‑Axis")
         hist_layout.addRow(self.check_log_scale_hist)
         self.btn_export_hist = QtWidgets.QPushButton("Export Histogram PNG…")
         hist_layout.addRow(self.btn_export_hist)
@@ -625,6 +686,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.check_log_scale_hist.stateChanged.connect(partial(self._update_plots))
         self.btn_export_hist.clicked.connect(self._export_histogram)
 
+    # ---------- Run control ----------
     def _on_plot_selected(self, index: int):
         self.plot_stack.setCurrentIndex(index)
         self.plot_settings_stack.setCurrentIndex(index)
@@ -646,26 +708,110 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker.resume()
             self.btn_pause_resume.setText("Pause")
 
+    # ---------- Parsing helpers ----------
+    @staticmethod
+    def _parse_pixel_spec(spec: str) -> List[int]:
+        indices: set[int] = set()
+        s = (spec or "").replace(" ", "").strip()
+        if not s:
+            return list(range(1, 101))
+        for tok in s.split(','):
+            if not tok:
+                continue
+            if '-' in tok:
+                try:
+                    a_str, b_str = tok.split('-', 1)
+                    a, b = int(a_str), int(b_str)
+                except ValueError:
+                    raise ValueError(f"Bad range token: '{tok}'")
+                step = 1 if b >= a else -1
+                for k in range(a, b + step, step):
+                    if 1 <= k <= 100:
+                        indices.add(k)
+            else:
+                try:
+                    k = int(tok)
+                except ValueError:
+                    raise ValueError(f"Bad index token: '{tok}'")
+                if 1 <= k <= 100:
+                    indices.add(k)
+        if not indices:
+            raise ValueError("No valid pixel indices in selection")
+        return sorted(indices)
+
+    def _ensure_run_folder(self) -> Path:
+        # Create a new run folder at the start of a multi‑loop run
+        if not self.output_folder or not self.output_folder.is_dir():
+            raise RuntimeError("Output folder is invalid. Choose a valid folder.")
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        exp_name = self.edit_exp_name.text().strip() or "Run"
+        self._run_folder = self.output_folder / f"{exp_name}_{timestamp}"
+        self._run_folder.mkdir(parents=True, exist_ok=True)
+        return self._run_folder
+
     def _start_scan(self):
+        # Validate output path up front (we will write CSVs each loop)
+        try:
+            run_folder = self._ensure_run_folder()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Output Folder", str(e))
+            return
+
+        # Parse pixel selection
+        try:
+            pixels = self._parse_pixel_spec(self.edit_pixel_spec.text())
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Pixel Selection", f"{e}")
+            return
+
+        # Manual current range value
+        auto_rng = self.check_auto_current_range.isChecked()
+        try:
+            cur_rng = float(self.edit_current_range.text())
+            if cur_rng <= 0:
+                raise ValueError
+        except Exception:
+            if auto_rng:
+                cur_rng = 1e-7
+            else:
+                QtWidgets.QMessageBox.critical(
+                    self, "Current Range", "Manual range must be a positive number (A)."
+                )
+                return
+
+        # Reset data for live plotting of loop 1
         self.data.fill(np.nan)
         self._update_plots(reset=True)
+
+        # Create worker
         self._worker = ScanWorker(
             self.sm,
             self.switch,
             n_samples=self.spin_nsamp.value(),
             nplc=self.spin_nplc.value(),
+            pixel_indices=pixels,
+            loops=self.spin_loops.value(),
+            auto_range=auto_rng,
+            current_range=cur_rng,
         )
         self._thread = QtCore.QThread()
         self._worker.moveToThread(self._thread)
+
+        # Signals
         self._worker.pixelDone.connect(self._update_pixel)
         self._worker.deviceError.connect(self._handle_device_error)
+        self._worker.loopStarted.connect(self._on_loop_started)
+        self._worker.loopFinished.connect(self._on_loop_finished)
         self._worker.finished.connect(self._scan_finished)
         self._thread.started.connect(self._worker.run)
+
+        # UI state
         self.btn_run_abort.setText("Abort")
         self.btn_pause_resume.setText("Pause")
         self.btn_pause_resume.setEnabled(True)
         self.btn_export.setEnabled(False)
         self._is_paused = False
+        self.statusBar().showMessage(f"Running… saving to {run_folder}")
         self._thread.start()
 
     def _abort_scan(self):
@@ -674,6 +820,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_run_abort.setEnabled(False)
             self._worker.stop()
 
+    # ---------- Loop callbacks ----------
+    def _on_loop_started(self, loop_idx: int):
+        self.data.fill(np.nan)
+        self._update_plots(reset=True)
+        self.statusBar().showMessage(f"Loop {loop_idx} started…", 3000)
+
+    def _on_loop_finished(self, loop_idx: int):
+        # Save CSV for this loop no matter what
+        try:
+            if not self._run_folder:
+                self._ensure_run_folder()
+            out_csv = self._run_folder / f"loop_{loop_idx:03d}_data.csv"
+            np.savetxt(out_csv, self.data, delimiter=",", fmt="%.5e")
+            self.statusBar().showMessage(f"Loop {loop_idx} → saved {out_csv}", 5000)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Loop Save Error", f"{e}")
+
+    # ---------- Device / UI plumbing ----------
     def _scan_finished(self):
         if self._thread:
             self._thread.quit()
@@ -685,12 +849,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_export.setEnabled(True)
         self._thread = None
         self._worker = None
-        if not np.all(np.isnan(self.data)):  # Only autosave if some data was collected
-            self._autosave_results()
+
+        # Optional summary artifacts (heatmap + histogram of final loop)
+        if self.check_autosave.isChecked():
+            try:
+                if not self._run_folder:
+                    self._ensure_run_folder()
+                self.figure_heatmap.savefig(
+                    self._run_folder / "summary_heatmap.png", dpi=300, bbox_inches="tight"
+                )
+                self.figure_hist.savefig(
+                    self._run_folder / "summary_histogram.png", dpi=300, bbox_inches="tight"
+                )
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Summary Save", f"Failed to save images: {e}")
 
     def _handle_device_error(self, message: str):
         logging.error(f"Device error during scan: {message}")
-        # Stop the worker. The finished signal will call _scan_finished for cleanup.
         if self._worker:
             self._worker.stop()
 
@@ -700,7 +875,6 @@ class MainWindow(QtWidgets.QMainWindow):
             f"A device has disconnected or failed.\n\n{message}\n\nThe scan has been aborted.",
         )
 
-        # Reset the specific device that failed
         if "switch" in message.lower():
             self.switch = DummySwitchBoard()
             self.switch_idn = "Switch: (disconnected)"
@@ -719,13 +893,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_plots()
 
     def _update_plots(self, reset: bool = False):
-        # --- Update Heatmap Data ---
+        # --- Heatmap ---
         self.ax_heatmap.set_title(self.edit_heatmap_title.text())
         for txt in self.value_text_annotations:
-            txt.remove()
+            try:
+                txt.remove()
+            except Exception:
+                pass
         self.value_text_annotations.clear()
-        if self.bad_channel_markers:
-            self.bad_channel_markers.remove()
+        if self.bad_channel_markers is not None:
+            try:
+                self.bad_channel_markers.remove()
+            except Exception:
+                pass
             self.bad_channel_markers = None
 
         if reset:
@@ -743,7 +923,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         vmin = max(1e-12, vmin * 0.9)
                         vmax = max(1e-12, vmax * 1.1)
                     if vmin <= 0 and use_log:
-                        vmin = 1e-12  # Log scale can't handle zero or negative
+                        vmin = 1e-12
                     self.edit_vmin.setText(f"{vmin:.3e}")
                     self.edit_vmax.setText(f"{vmax:.3e}")
                 else:
@@ -756,9 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 self.im.set_cmap(self.combo_colormap.currentText())
                 if use_log:
-                    self.im.set_norm(
-                        LogNorm(vmin=max(vmin, 1e-12), vmax=max(vmax, 1e-11))
-                    )
+                    self.im.set_norm(LogNorm(vmin=max(vmin, 1e-12), vmax=max(vmax, 1e-11)))
                 else:
                     self.im.set_norm(Normalize(vmin=vmin, vmax=vmax))
 
@@ -768,7 +946,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         for c in range(10):
                             val = self.data[r, c]
                             if not np.isnan(val):
-                                norm_val = norm(val) if norm and val > 0 else 0.5
+                                norm_val = float(norm(val)) if (norm and val > 0) else 0.5
                                 color = "white" if norm_val < 0.5 else "black"
                                 self.value_text_annotations.append(
                                     self.ax_heatmap.text(
@@ -791,20 +969,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.figure_heatmap.tight_layout(pad=2.5)
         self.canvas_heatmap.draw_idle()
 
-        # --- Update Histogram Data ---
+        # --- Histogram ---
         self.ax_hist.clear()
         self.ax_hist.set_title(self.edit_hist_title.text())
         valid_data = self.data[~np.isnan(self.data)]
         if valid_data.size > 0:
-            self.ax_hist.hist(
-                valid_data.flatten(), bins=self.spin_bins.value(), color="gray"
-            )
+            self.ax_hist.hist(valid_data.flatten(), bins=self.spin_bins.value(), color="gray")
         if self.check_log_scale_hist.isChecked():
             self.ax_hist.set_yscale("log")
         self.ax_hist.grid(True, linestyle="--", alpha=0.6)
         self.ax_hist.set_xlabel("Current (A)")
         self.ax_hist.set_ylabel("Pixel Count")
-
         self.figure_hist.tight_layout(pad=2.5)
         self.canvas_hist.draw_idle()
 
@@ -817,11 +992,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_status_text(self):
         self.status_text.setText(f"{self.sm_idn}\n{self.switch_idn}")
 
-    def _export_csv(self):
+    # ---------- Exports ----------
+    def _export_csv_once(self):
         fname, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save CSV",
-            str(self.output_folder / "photodiode_scan.csv"),
+            str((self._run_folder or self.output_folder) / "photodiode_scan.csv"),
             "CSV files (*.csv);;All files (*)",
         )
         if not fname:
@@ -836,7 +1012,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fname, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save PNG",
-            str(self.output_folder / default_name),
+            str((self._run_folder or self.output_folder) / default_name),
             "PNG files (*.png);;All files (*)",
         )
         if not fname:
@@ -853,6 +1029,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _export_histogram(self):
         self._export_figure(self.figure_hist, "histogram.png")
 
+    # ---------- Folders / LED / Connect ----------
     def _select_output_folder(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Select Output Folder", str(self.output_folder)
@@ -861,57 +1038,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.output_folder = Path(folder)
             self.edit_output_folder.setText(str(self.output_folder))
 
-    def _autosave_results(self):
-        if not self.check_autosave.isChecked():
-            return
-        exp_name = self.edit_exp_name.text().strip()
-        if not exp_name:
-            QtWidgets.QMessageBox.warning(
-                self, "Autosave", "Please enter an experiment name to autosave."
-            )
-            return
-        if not self.output_folder or not self.output_folder.is_dir():
-            QtWidgets.QMessageBox.warning(
-                self, "Autosave", "Please select a valid output folder to autosave."
-            )
-            return
-
-        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        run_folder_name = f"{exp_name}_{timestamp}"
-        run_folder = self.output_folder / run_folder_name
-
-        try:
-            run_folder.mkdir(parents=True, exist_ok=True)
-            np.savetxt(run_folder / "data.csv", self.data, delimiter=",", fmt="%.5e")
-            self.figure_heatmap.savefig(
-                run_folder / "heatmap.png", dpi=300, bbox_inches="tight"
-            )
-            self.figure_hist.savefig(
-                run_folder / "histogram.png", dpi=300, bbox_inches="tight"
-            )
-            self.statusBar().showMessage(f"Autosaved to {run_folder}", 5000)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Autosave Error", f"Failed to save results: {e}"
-            )
-
     def _on_led_toggled(self, checked: bool):
         cmd = b"LED ON\n" if checked else b"LED OFF\n"
         try:
             if self.switch and hasattr(self.switch, "ser"):
                 self.switch.ser.write(cmd)
-                self.btn_leds.setStyleSheet(
-                    "background-color: lightgreen" if checked else ""
-                )
+                self.btn_leds.setStyleSheet("background-color: lightgreen" if checked else "")
             else:
                 raise IOError("Switch not connected or is a dummy device.")
         except Exception as e:
             logging.error(f"Failed to send LED command: {e}")
             self.btn_leds.setChecked(not checked)
             self.btn_leds.setStyleSheet("background-color: red")
-            QtWidgets.QMessageBox.warning(
-                self, "LED Control", f"Failed to send command: {e}"
-            )
+            QtWidgets.QMessageBox.warning(self, "LED Control", f"Failed to send command: {e}")
 
     def _connect_sm(self):
         dlg = _DevicePickDialog(self, title="Connect Sourcemeter", show_gpib_addr=True)
@@ -940,9 +1079,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if not (ident and len(ident) > 3):
                 raise RuntimeError("Device did not respond to *IDN?")
             if use_visa:
-                self.sm.use_rear_terminals()
-                # means we are using the 2400, make sure to use the back panel
-
+                try:
+                    self.sm.use_rear_terminals()
+                except Exception:
+                    pass
             self.sm_idn = f"Sourcemeter: {ident.strip()}"
             self._update_status_text()
             self.btn_connect_sm.setStyleSheet("background-color: lightgreen")
@@ -954,14 +1094,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sm_idn = "Sourcemeter: DUMMY TEST DEVICE"
             self._update_status_text()
             self.btn_connect_sm.setStyleSheet("")
-            QtWidgets.QMessageBox.critical(
-                self, "Sourcemeter", f"Failed to connect/validate: {e}"
-            )
+            QtWidgets.QMessageBox.critical(self, "Sourcemeter", f"Failed to connect/validate: {e}")
 
     def _connect_switch(self):
-        dlg = _DevicePickDialog(
-            self, title="Connect Switch Board", show_gpib_addr=False
-        )
+        dlg = _DevicePickDialog(self, title="Connect Switch Board", show_gpib_addr=False)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
         port, _ = dlg.get_selection()
@@ -985,19 +1121,15 @@ class MainWindow(QtWidgets.QMainWindow):
             ser.write(b"SWSTATUS\n")
             status_response = ser.readline().decode("utf-8").strip()
             if status_response:
-                self.inactive_channels = [
-                    int(x) for x in status_response.split(",") if x.strip()
-                ]
+                self.inactive_channels = [int(x) for x in status_response.split(',') if x.strip()]
                 self.inactive_channels_display.setText(status_response)
             else:
                 self.inactive_channels = []
                 self.inactive_channels_display.setText("(none)")
 
             self._update_status_text()
-            self._update_plots(reset=True)  # Redraw to show inactive channels
-            QtWidgets.QMessageBox.information(
-                self, "Switch", f"Connected on {port}.\nID: {idn_response}"
-            )
+            self._update_plots(reset=True)
+            QtWidgets.QMessageBox.information(self, "Switch", f"Connected on {port}.\nID: {idn_response}")
 
         except Exception as e:
             self.switch = DummySwitchBoard()

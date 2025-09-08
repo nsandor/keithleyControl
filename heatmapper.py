@@ -113,7 +113,9 @@ class MainWindow(QMainWindow):
         self.datasets = {}
         self.current_data_key = None
         self.subtract_data_key = None
+        self.divide_data_key = None
         self.result_data = None
+        self.operation = None  # None | 'subtract' | 'divide'
         
         # --- Member for annotation event handling ---
         self.annotation_cid = None
@@ -149,12 +151,18 @@ class MainWindow(QMainWindow):
         data_layout = QFormLayout()
         self.data_selector = QComboBox()
         self.subtract_selector = QComboBox()
+        self.divide_selector = QComboBox()
         self.subtract_button = QPushButton("Subtract Selected")
+        self.divide_button = QPushButton("Divide Selected")
         self.clear_subtract_button = QPushButton("Clear Subtraction")
+        self.clear_divide_button = QPushButton("Clear Division")
         data_layout.addRow(QLabel("Primary Data:"), self.data_selector)
         data_layout.addRow(QLabel("Subtract Data:"), self.subtract_selector)
         data_layout.addRow(self.subtract_button)
         data_layout.addRow(self.clear_subtract_button)
+        data_layout.addRow(QLabel("Divide Data:"), self.divide_selector)
+        data_layout.addRow(self.divide_button)
+        data_layout.addRow(self.clear_divide_button)
         data_group.setLayout(data_layout)
         left_layout.addWidget(data_group)
         
@@ -233,8 +241,11 @@ class MainWindow(QMainWindow):
         self.export_img_button.clicked.connect(self.export_image)
         self.data_selector.currentIndexChanged.connect(self.select_primary_data)
         self.subtract_selector.currentIndexChanged.connect(self.select_subtract_data)
+        self.divide_selector.currentIndexChanged.connect(self.select_divide_data)
         self.subtract_button.clicked.connect(self.perform_subtraction)
+        self.divide_button.clicked.connect(self.perform_division)
         self.clear_subtract_button.clicked.connect(self.clear_subtraction)
+        self.clear_divide_button.clicked.connect(self.clear_division)
         self.cmap_selector.currentTextChanged.connect(self.update_plot)
         self.update_range_button.clicked.connect(self.update_plot)
         self.log_scale_toggle.clicked.connect(self.toggle_log_scale)
@@ -314,7 +325,8 @@ class MainWindow(QMainWindow):
         """Export the currently displayed data to a CSV file."""
         if self.result_data is not None:
             data_to_save = self.result_data
-            default_name = f"subtraction_result.csv"
+            op_name = 'division' if self.operation == 'divide' else 'subtraction'
+            default_name = f"{op_name}_result.csv"
         elif self.current_data_key:
             data_to_save = self.datasets[self.current_data_key]
             default_name = f"exported_{self.current_data_key}"
@@ -349,15 +361,21 @@ class MainWindow(QMainWindow):
         keys = list(self.datasets.keys())
         self.data_selector.clear()
         self.data_selector.addItems(keys)
+        
         self.subtract_selector.clear()
         self.subtract_selector.addItem("None")
         self.subtract_selector.addItems(keys)
+        
+        self.divide_selector.clear()
+        self.divide_selector.addItem("None")
+        self.divide_selector.addItems(keys)
         
     def select_primary_data(self, index):
         """Handle selection of the primary dataset."""
         if index >= 0:
             self.current_data_key = self.data_selector.itemText(index)
-            self.result_data = None # Clear subtraction result
+            self.result_data = None # Clear operation result
+            self.operation = None
             self.update_plot()
             
     def select_subtract_data(self, index):
@@ -367,23 +385,61 @@ class MainWindow(QMainWindow):
         else:
             self.subtract_data_key = None
             
+    def select_divide_data(self, index):
+        """Handle selection of the dataset to divide by."""
+        if index > 0: # Index 0 is "None"
+            self.divide_data_key = self.divide_selector.itemText(index)
+        else:
+            self.divide_data_key = None
+            
     def perform_subtraction(self):
         """Subtract one dataset from another."""
         if self.current_data_key and self.subtract_data_key:
             primary_data = self.datasets[self.current_data_key]
             subtract_data = self.datasets[self.subtract_data_key]
+            if primary_data.shape != subtract_data.shape:
+                QMessageBox.warning(self, "Subtraction Error", "Datasets must have the same shape.")
+                return
             self.result_data = primary_data - subtract_data
-            # If any of the datapoints are equal to zero after subtraction, set them to a small value to avoid log(0) issues
+            # Avoid exact zeros to be log-safe
             self.result_data[self.result_data == 0] = 1e-10
-            #self.update_selectors()  # Ensure the selectors are updated
+            self.operation = 'subtract'
             self.update_plot()
         else:
             QMessageBox.warning(self, "Subtraction Error", "Please select both a primary and a subtract dataset.")
             
+    def perform_division(self):
+        """Divide one dataset by another (element-wise)."""
+        if self.current_data_key and self.divide_data_key:
+            primary_data = self.datasets[self.current_data_key]
+            denom_data = self.datasets[self.divide_data_key]
+            if primary_data.shape != denom_data.shape:
+                QMessageBox.warning(self, "Division Error", "Datasets must have the same shape.")
+                return
+            with np.errstate(divide='ignore', invalid='ignore'):
+                result = np.true_divide(primary_data, denom_data)
+                # Replace inf/NaN from division by zero with 0 for display stability
+                result[~np.isfinite(result)] = 0.0
+            # Avoid exact zeros to be log-safe if user enables log scale
+            result[result == 0] = 1e-10
+            self.result_data = result
+            self.operation = 'divide'
+            self.update_plot()
+        else:
+            QMessageBox.warning(self, "Division Error", "Please select both a primary and a divide dataset.")
+            
     def clear_subtraction(self):
         """Clear the subtraction result and show the primary data."""
         self.result_data = None
+        self.operation = None
         self.subtract_selector.setCurrentIndex(0)
+        self.update_plot()
+        
+    def clear_division(self):
+        """Clear the division result and show the primary data."""
+        self.result_data = None
+        self.operation = None
+        self.divide_selector.setCurrentIndex(0)
         self.update_plot()
         
     def toggle_log_scale(self):
@@ -413,6 +469,13 @@ class MainWindow(QMainWindow):
         """Generate appropriate colorbar label with units."""
         base_label = self.colorbar_label_input.text()
         units = self.units_selector.currentText()
+        
+        # Division yields a unitless ratio
+        if self.operation == 'divide':
+            if base_label:
+                return f"{base_label} (ratio)"
+            else:
+                return "Ratio"
         
         if base_label:
             return f"{base_label} ({units})"
@@ -471,9 +534,12 @@ class MainWindow(QMainWindow):
             data_to_plot = self.datasets[self.current_data_key]
             
         if data_to_plot is not None:
-            # Convert data to selected units
+            # Convert data to selected units unless we're showing a unitless ratio
             selected_units = self.units_selector.currentText()
-            converted_data = self.convert_data_units(data_to_plot, selected_units)
+            if self.operation == 'divide':
+                converted_data = data_to_plot  # unitless ratio
+            else:
+                converted_data = self.convert_data_units(data_to_plot, selected_units)
             
             cmap = self.cmap_selector.currentText()
             try:
