@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-# photodiode_array_live_grid.py  –  2025-09-08 (rev-F)
+# photodiode_array_live_grid.py  –  2025-09-09 (rev-G)
 #
 # Photodiode array readout GUI **WITH HEATMAP + CSV EXPORT**
 # • One Keithley sourcemeter (bias locked to 0 V)
 # • USB 100:1 switch (Nano Every firmware v1.0) – or Dummy for offline testing
-# • Reads average current over N samples for selected pixels (single‑shot per loop)
-# • Displays a live 10×10 heat‑map (auto/manual scaling)
+# • Reads average current over N samples for selected pixels (single-shot per loop)
+# • Displays a live 10×10 heat-map (auto/manual scaling)
 # • Exports CSV per loop + optional summary exports at end
-# --- NEW (rev‑F):
-#     • Pixel subset selection (e.g., "50-70, 1, 10-12")
-#     • Multi‑loop execution with CSV after each loop (loop_###.csv)
-#     • Manual current range option (disable auto‑range and set range)
-# --- PREV (rev‑E): selector for plots, contextual settings, disconnection‑tolerant I/O
+# --- NEW (rev-G):
+#     • Load reference CSV and optionally apply math to the LIVE VIEW:
+#         - Divide:   display = live / (ref + ε)
+#         - Subtract: display = live - ref
+#       (Raw data stays unmodified; saving processed CSVs is opt-in.)
+#     • Unique per-loop CSV filenames: loop_###_<tag>.csv
+# --- rev-F:
+#     • Pixel subset selection, multi-loop CSVs, manual current range
+# --- PREV (rev-E): selector for plots, contextual settings, disconnection-tolerant I/O
 #
 # NOTE: PyMeasure, PyQt5/PySide6, matplotlib, and pyserial are required.
 # ----------------------------------------------------------------------
 
 import sys
 import time
+import uuid
 import logging
 from pathlib import Path
 from typing import Optional, List, Iterable
@@ -37,6 +42,7 @@ try:
 except Exception:
     serial = None
     list_ports = None
+
 # ----------------------------------------------------------------------
 # Qt binding (PyQt5 preferred, fall back to PySide6)
 # ----------------------------------------------------------------------
@@ -52,14 +58,12 @@ import matplotlib
 
 matplotlib.use("Qt5Agg")  # ensure Qt backend
 matplotlib.set_loglevel("warning")
-from matplotlib.backends.backend_qt5agg import (
-    FigureCanvasQTAgg as FigureCanvas,
-)  # noqa: E402
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa: E402
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
 
 # ----------------------------------------------------------------------
-# Keithley instruments via PyMeasure – with a zero‑volt safety wrapper
+# Keithley instruments via PyMeasure – with a zero-volt safety wrapper
 # ----------------------------------------------------------------------
 try:
     from pymeasure.instruments.keithley import Keithley2400
@@ -288,7 +292,7 @@ class SwitchBoard:
 
     def route(self, idx: int):
         if not 1 <= idx <= 100:
-            raise ValueError("Pixel index must be 1‑100")
+            raise ValueError("Pixel index must be 1-100")
         self.ser.write(f"{idx}\n".encode())
         response = self.ser.readline()
         if b"ACK" not in response:
@@ -344,7 +348,7 @@ class ScanWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def run(self):
-        # Configure SM once at start; re‑use across loops
+        # Configure SM once at start; re-use across loops
         try:
             self._sm.reset()
             self._sm.enable_source()
@@ -429,14 +433,21 @@ class ScanWorker(QtCore.QObject):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Photodiode Array – Live Current Heat‑map")
-        self.resize(1060, 880)
+        self.setWindowTitle("Photodiode Array – Live Current Heat-map")
+        self.resize(1100, 900)
         self.setStatusBar(QtWidgets.QStatusBar(self))
 
-        self.data = np.full((10, 10), np.nan)
+        self.data = np.full((10, 10), np.nan)          # raw live data
         self.sm: Optional[Keithley2400] = DummyKeithley2400()
         self.switch: Optional[SwitchBoard] = DummySwitchBoard()
         self._run_folder: Optional[Path] = None
+
+        # --- REF / math state (new) ---
+        self.ref_matrix: Optional[np.ndarray] = None
+        self.ref_path: Optional[Path] = None
+        self.math_mode: str = "none"                   # "none" | "divide" | "subtract"
+        self.math_eps: float = 1e-12
+        self.save_processed: bool = False              # opt-in
 
         # --- Main Layout: Control Panel | Plot Area ---
         central = QtWidgets.QSplitter()
@@ -483,8 +494,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.check_auto_current_range.toggled.connect(
             lambda b: self.edit_current_range.setEnabled(not b)
         )
+        # ^ Python doesn't support !, fix:
+        self.check_auto_current_range.toggled.disconnect()
+        self.check_auto_current_range.toggled.connect(
+            lambda b: self.edit_current_range.setEnabled(not b)
+        )
 
         ctrl_layout.addWidget(scan_settings_box)
+
+        # --- Math with Reference CSV (NEW) ---
+        math_box = QtWidgets.QGroupBox("Dark Ref")
+        math_layout = QtWidgets.QFormLayout(math_box)
+
+        self.btn_load_ref = QtWidgets.QPushButton("Load Ref CSV…")
+        self.lbl_ref_info = QtWidgets.QLabel("(none)")
+        ref_row = QtWidgets.QHBoxLayout()
+        ref_row.addWidget(self.btn_load_ref)
+        ref_row.addWidget(self.lbl_ref_info, 1)
+        math_layout.addRow("Reference:", ref_row)
+
+        self.combo_math = QtWidgets.QComboBox()
+        self.combo_math.addItems(["None", "Divide (live / ref)", "Subtract (live - ref)"])
+        math_layout.addRow("Operation:", self.combo_math)
+
+        #self.edit_eps = QtWidgets.QLineEdit("1e-12")
+        #self.edit_eps.setToolTip("Small ε added to denominator for divide to avoid zero")
+        #self.edit_eps.setEnabled(False)
+        #math_layout.addRow("Epsilon (divide):", self.edit_eps)
+
+        self.check_save_processed = QtWidgets.QCheckBox(
+            "Save processed CSVs instead of raw"
+        )
+        math_layout.addRow(self.check_save_processed)
+
+        ctrl_layout.addWidget(math_box)
+
+        # Wire math signals
+        self.btn_load_ref.clicked.connect(self._load_reference_csv)
+        self.combo_math.currentIndexChanged.connect(self._math_mode_changed)
+        #self.edit_eps.editingFinished.connect(self._update_eps)
+        self.check_save_processed.toggled.connect(self._toggle_save_processed)
 
         # Run controls
         self.btn_run_abort = QtWidgets.QPushButton("Run Scan")
@@ -636,7 +685,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.check_log_scale_heatmap = QtWidgets.QCheckBox("Logarithmic Color Scale")
         self.check_log_scale_heatmap.setChecked(True)
         plot_layout.addRow(self.check_log_scale_heatmap)
-        self.check_auto_scale = QtWidgets.QCheckBox("Auto‑scale Color Limit")
+        self.check_auto_scale = QtWidgets.QCheckBox("Auto-scale Color Limit")
         self.check_auto_scale.setChecked(True)
         plot_layout.addRow(self.check_auto_scale)
         self.edit_vmin = QtWidgets.QLineEdit("1e-10")
@@ -674,7 +723,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_bins.setRange(5, 200)
         self.spin_bins.setValue(25)
         hist_layout.addRow("Number of Bins:", self.spin_bins)
-        self.check_log_scale_hist = QtWidgets.QCheckBox("Logarithmic Y‑Axis")
+        self.check_log_scale_hist = QtWidgets.QCheckBox("Logarithmic Y-Axis")
         hist_layout.addRow(self.check_log_scale_hist)
         self.btn_export_hist = QtWidgets.QPushButton("Export Histogram PNG…")
         hist_layout.addRow(self.btn_export_hist)
@@ -740,7 +789,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return sorted(indices)
 
     def _ensure_run_folder(self) -> Path:
-        # Create a new run folder at the start of a multi‑loop run
+        # Create a new run folder at the start of a multi-loop run
         if not self.output_folder or not self.output_folder.is_dir():
             raise RuntimeError("Output folder is invalid. Choose a valid folder.")
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -823,17 +872,21 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- Loop callbacks ----------
     def _on_loop_started(self, loop_idx: int):
         self.data.fill(np.nan)
+        self._current_loop_tag = uuid.uuid4().hex[:6].upper()  # NEW unique tag per loop
         self._update_plots(reset=True)
         self.statusBar().showMessage(f"Loop {loop_idx} started…", 3000)
 
     def _on_loop_finished(self, loop_idx: int):
-        # Save CSV for this loop no matter what
+        # Save CSV for this loop; raw or processed per checkbox
         try:
             if not self._run_folder:
                 self._ensure_run_folder()
-            out_csv = self._run_folder / f"loop_{loop_idx:03d}_data.csv"
-            np.savetxt(out_csv, self.data, delimiter=",", fmt="%.5e")
-            self.statusBar().showMessage(f"Loop {loop_idx} → saved {out_csv}", 5000)
+            out_name = f"loop_{loop_idx:03d}_{self._current_loop_tag}_data.csv"
+            out_csv = self._run_folder / out_name
+            arr = self._apply_math(self.data) if self.save_processed else self.data
+            np.savetxt(out_csv, arr, delimiter=",", fmt="%.5e")
+            mode = "processed" if self.save_processed else "raw"
+            self.statusBar().showMessage(f"Loop {loop_idx} → saved {out_csv} ({mode})", 5000)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Loop Save Error", f"{e}")
 
@@ -850,7 +903,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread = None
         self._worker = None
 
-        # Optional summary artifacts (heatmap + histogram of final loop)
+        # Optional summary artifacts (heatmap + histogram of final loop as DISPLAYED)
         if self.check_autosave.isChecked():
             try:
                 if not self._run_folder:
@@ -892,15 +945,93 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data[r, c] = i_avg
         self._update_plots()
 
+    # ---------- Math / Reference (NEW) ----------
+    def _load_reference_csv(self):
+        fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Reference CSV", str(self.output_folder), "CSV files (*.csv);;All files (*)"
+        )
+        if not fname:
+            return
+        try:
+            arr = np.loadtxt(fname, delimiter=",")
+            arr = np.asarray(arr, dtype=float)
+            if arr.shape != (10, 10):
+                # Accept 100-element flat as well
+                if arr.size == 100:
+                    arr = arr.reshape((10, 10))
+                else:
+                    raise ValueError(f"Reference CSV must be 10×10 (or 100 values). Got {arr.shape}.")
+            self.ref_matrix = arr
+            self.ref_path = Path(fname)
+            self.lbl_ref_info.setText(f"{self.ref_path.name}  [{arr.shape[0]}×{arr.shape[1]}]")
+            self._update_plots()
+        except Exception as e:
+            self.ref_matrix = None
+            self.ref_path = None
+            self.lbl_ref_info.setText("(none)")
+            QtWidgets.QMessageBox.critical(self, "Reference CSV", f"Failed to load: {e}")
+
+    def _math_mode_changed(self, _index: int):
+        text = self.combo_math.currentText().lower()
+        if text.startswith("divide"):
+            self.math_mode = "divide"
+            #self.edit_eps.setEnabled(True)
+        elif text.startswith("subtract"):
+            self.math_mode = "subtract"
+            #self.edit_eps.setEnabled(False)
+        else:
+            self.math_mode = "none"
+            #self.edit_eps.setEnabled(False)
+        self._update_plots()
+
+    #def _update_eps(self):
+    #    try:
+    #        val = float(self.edit_eps.text())
+    #        if val <= 0:
+    #            raise ValueError
+    #        self.math_eps = val
+    ##    except Exception:
+     #       QtWidgets.QMessageBox.warning(self, "Epsilon", "ε must be a positive float.")
+     #       self.edit_eps.setText(f"{self.math_eps:g}")
+
+    def _toggle_save_processed(self, checked: bool):
+        self.save_processed = bool(checked)
+
+    def _apply_math(self, data: np.ndarray) -> np.ndarray:
+        """Return the matrix to display/export given current settings.
+        Raw data is never mutated; this function is pure."""
+        if self.math_mode == "none" or self.ref_matrix is None:
+            return data
+        ref = self.ref_matrix
+        if ref.shape != (10, 10):
+            # Shouldn't happen (validated on load), but guard anyway
+            return data
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if self.math_mode == "divide":
+                # Add epsilon only where needed
+                denom = ref + self.math_eps
+                out = np.divide(data, denom, where=~np.isnan(data))
+            elif self.math_mode == "subtract":
+                out = data - ref
+            else:
+                out = data
+        # Preserve NaNs from original where no measurement yet
+        mask_nan = np.isnan(data)
+        out = np.where(mask_nan, np.nan, out)
+        return out
+
+    # ---------- Plotting ----------
     def _update_plots(self, reset: bool = False):
         # --- Heatmap ---
         self.ax_heatmap.set_title(self.edit_heatmap_title.text())
-        for txt in self.value_text_annotations:
-            try:
-                txt.remove()
-            except Exception:
-                pass
-        self.value_text_annotations.clear()
+        # Clear prior overlays
+        if hasattr(self, "value_text_annotations"):
+            for txt in self.value_text_annotations:
+                try:
+                    txt.remove()
+                except Exception:
+                    pass
+            self.value_text_annotations.clear()
         if self.bad_channel_markers is not None:
             try:
                 self.bad_channel_markers.remove()
@@ -909,16 +1040,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.bad_channel_markers = None
 
         if reset:
-            self.im.set_data(np.full((10, 10), np.nan))
+            display = np.full((10, 10), np.nan)
+            self.im.set_data(display)
         else:
-            valid_data = self.data[~np.isnan(self.data)]
-            if valid_data.size == 0:
+            # Compute display data (may be processed)
+            base = self.data
+            display = self._apply_math(base)
+            valid = display[~np.isnan(display)]
+            if valid.size == 0:
                 self.im.set_data(np.full((10, 10), np.nan))
             else:
-                self.im.set_data(self.data)
+                self.im.set_data(display)
                 use_log = self.check_log_scale_heatmap.isChecked()
                 if self.check_auto_scale.isChecked():
-                    vmin, vmax = np.nanmin(valid_data), np.nanmax(valid_data)
+                    vmin, vmax = np.nanmin(valid), np.nanmax(valid)
                     if vmin == vmax:
                         vmin = max(1e-12, vmin * 0.9)
                         vmax = max(1e-12, vmax * 1.1)
@@ -942,9 +1077,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 if self.check_show_values.isChecked():
                     norm = self.im.norm
+                    self.value_text_annotations = []
                     for r in range(10):
                         for c in range(10):
-                            val = self.data[r, c]
+                            val = display[r, c]
                             if not np.isnan(val):
                                 norm_val = float(norm(val)) if (norm and val > 0) else 0.5
                                 color = "white" if norm_val < 0.5 else "black"
@@ -969,10 +1105,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.figure_heatmap.tight_layout(pad=2.5)
         self.canvas_heatmap.draw_idle()
 
-        # --- Histogram ---
+        # --- Histogram (uses display data too) ---
         self.ax_hist.clear()
         self.ax_hist.set_title(self.edit_hist_title.text())
-        valid_data = self.data[~np.isnan(self.data)]
+        display = self._apply_math(self.data)
+        valid_data = display[~np.isnan(display)]
         if valid_data.size > 0:
             self.ax_hist.hist(valid_data.flatten(), bins=self.spin_bins.value(), color="gray")
         if self.check_log_scale_hist.isChecked():
@@ -994,16 +1131,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------- Exports ----------
     def _export_csv_once(self):
+        # Use processed or raw based on checkbox
+        default_name = "photodiode_scan_processed.csv" if self.save_processed else "photodiode_scan_raw.csv"
         fname, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save CSV",
-            str((self._run_folder or self.output_folder) / "photodiode_scan.csv"),
+            str((self._run_folder or self.output_folder) / default_name),
             "CSV files (*.csv);;All files (*)",
         )
         if not fname:
             return
         try:
-            np.savetxt(fname, self.data, delimiter=",", fmt="%.5e")
+            arr = self._apply_math(self.data) if self.save_processed else self.data
+            np.savetxt(fname, arr, delimiter=",", fmt="%.5e")
             QtWidgets.QMessageBox.information(self, "Export", f"Saved to {fname}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Export", f"Failed: {e}")
@@ -1145,7 +1285,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    
+
     SplashScreen = QtWidgets.QSplashScreen(QtGui.QPixmap("res/icons/FireGrid.png"))
     SplashScreen.show()
     win = MainWindow()
