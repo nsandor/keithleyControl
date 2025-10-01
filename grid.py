@@ -399,7 +399,7 @@ class ScanWorker(QtCore.QObject):
                             logging.warning(f"Read failed: {e}")
                             self.deviceError.emit(f"Sourcemeter connection lost: {e}")
                             raise
-                        vals.append(abs(val))
+                        vals.append(val)
 
                     if self._stop:
                         break
