@@ -215,28 +215,6 @@ class JVJTProcedure(Procedure):
         self.test_time_metadata = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         log.info("Instrument setup complete.")
 
-    def chime(self):
-        def chime(self):
-            """Plays a C-A-F major chord sequence using the system beep for test completion.
-            Real ones know where this is from."""
-            if hasattr(self.sourcemeter, "triad"):
-                try:
-                    # Base frequencies for C, A, and F notes in Hz
-                    c_freq = 261.63  # Middle C
-                    a_freq = 440.00  # A4
-                    f_freq = 349.23  # F4
-                    duration = 0.25  # Duration of each chord in seconds
-
-                    self.sourcemeter.beep(c_freq, duration)
-                    time.sleep(duration)
-                    self.sourcemeter.beep(a_freq, duration)
-                    time.sleep(duration)
-                    self.sourcemeter.beep(f_freq, duration)
-                except Exception as e:
-                    log.warning(f"Failed to play chime: {e}")
-            else:
-                log.warning("Sourcemeter does not support triad functionality.")
-
     def execute(self):
         if self.measurement_mode == "JV":
             log.info("Starting JV Measurement")
@@ -373,7 +351,6 @@ class JVJTProcedure(Procedure):
                 self.emit("results", data)
                 self.emit("progress", 100 * (count + 1) / total_steps)
                 self.jv_data.append((voltage, current))
-            self.chime()
             log.info("JV Measurement finished.")
 
         elif self.measurement_mode == "JT":
@@ -474,7 +451,6 @@ class JVJTProcedure(Procedure):
                 and elapsed_time >= self.measurement_time
             ):
                 log.warning("User aborted the procedure during JT measurement.")
-            self.chime()
             log.info("JT Measurement finished.")
 
     def shutdown(self):
