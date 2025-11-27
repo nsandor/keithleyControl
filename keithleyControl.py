@@ -6,8 +6,8 @@ from time import sleep
 # -- Force a non‐GUI backend before importing pyplot --
 import matplotlib
 import numpy as np
+from DevicePicker import DevicePicker
 from pymeasure.adapters import PrologixAdapter, VISAAdapter
-from pymeasure.log import log
 from PyQt5.QtGui import QIcon  # Add this import
 
 from drivers.dummy_keithley import DummyKeithley2400
@@ -29,13 +29,65 @@ from pymeasure.experiment import (
 # Both the 6430 and 2450 use essentially the same commands, so the 2400 driver works fine
 from pymeasure.instruments.keithley import Keithley2400
 
-# Testing mode, uses dummy driver
-test = True
-
 import logging
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
+
+DEFAULT_GPIB_ADDRESS = 5
+try:
+    DEFAULT_GPIB_ADDRESS = int(
+        os.environ.get("KEITHLEYCONTROL_GPIB_ADDRESS", DEFAULT_GPIB_ADDRESS)
+    )
+except ValueError:
+    pass
+
+
+def _consume_test_flag(argv):
+    """Return True if -TEST is present; strip it so Qt won't see it."""
+    test_tokens = {"-TEST", "--TEST", "/TEST"}
+    found = False
+    keep = []
+    for arg in argv:
+        if arg.upper() in test_tokens:
+            found = True
+            continue
+        keep.append(arg)
+    argv[:] = keep
+    return found
+
+
+ALLOW_DUMMY = _consume_test_flag(sys.argv)
+
+
+def _dialog_exec(dialog):
+    exec_fn = getattr(dialog, "exec", None) or getattr(dialog, "exec_", None)
+    return exec_fn()
+
+
+def _looks_like_serial_resource(resource: str) -> bool:
+    if not resource:
+        return False
+    text = resource.strip().lower()
+    return (
+        text.startswith("asrl")
+        or text.startswith("com")
+        or text.startswith("/dev/")
+        or text.startswith("tty")
+    )
+
+
+def _normalize_serial_resource(resource: str) -> str:
+    res = resource.strip()
+    upper = res.upper()
+    if upper.startswith("ASRL"):
+        return res if upper.endswith("::INSTR") else f"{res}::INSTR"
+    if upper.startswith("COM"):
+        digits = "".join(ch for ch in res if ch.isdigit())
+        return f"ASRL{digits}::INSTR" if digits else res
+    if res.startswith("/"):
+        return f"ASRL{res}::INSTR"
+    return res
 
 
 def resource_path(relative_path):
@@ -51,6 +103,8 @@ def resource_path(relative_path):
 
 
 class JVJTProcedure(Procedure):
+    device_selection = None
+    test_mode = ALLOW_DUMMY
     measurement_mode = ListParameter(
         "Measurement mode",
         ["JV", "JT"],
@@ -139,52 +193,88 @@ class JVJTProcedure(Procedure):
     sm_type_metadata = Metadata("Sourcemeter Type", default="None")
     test_time_metadata = Metadata("Test Time", default="None")
 
+    def _connect_dummy(self):
+        self.sourcemeter = DummyKeithley2400()
+        self.Sourcemeter_type = "Dummy"
+        log.info("Using dummy sourcemeter (test mode).")
+
+    def _configure_2450_compat(self):
+        try:
+            self.sourcemeter.write("SYST:LANG SCPI")
+            self.sourcemeter.write("SYST:CONS 2400")
+            log.info("Configured 2450 for 2400 SCPI compatibility.")
+        except Exception as exc:
+            log.warning(f"Failed to set 2450 compatibility: {exc}")
+
+    def _detect_model(self):
+        try:
+            ident = self.sourcemeter.ask("*IDN?")
+            if ident:
+                log.info(f"Instrument ID: {ident.strip()}")
+                for model in ("2450", "2400", "6430"):
+                    if model in ident:
+                        return model
+        except Exception as exc:
+            log.warning(f"Could not query instrument ID: {exc}")
+        return None
+
+    def _connect_instrument(self):
+        use_dummy = getattr(self, "test_mode", None)
+        if use_dummy is None:
+            use_dummy = JVJTProcedure.test_mode
+        selection = getattr(self, "device_selection", None) or JVJTProcedure.device_selection
+        self.device_selection = selection
+        self.test_mode = use_dummy
+
+        if use_dummy:
+            self._connect_dummy()
+            return
+
+        if not selection or not selection.get("resource"):
+            raise RuntimeError("No instrument selected. Choose Device -> Select Sourcemeter.")
+
+        resource = selection["resource"]
+        gpib_address = selection.get("gpib")
+        if gpib_address is None:
+            gpib_address = DEFAULT_GPIB_ADDRESS
+
+        try:
+            if _looks_like_serial_resource(resource):
+                visa_resource = _normalize_serial_resource(resource)
+                log.info(
+                    f"Connecting via Prologix adapter on {visa_resource} (GPIB {gpib_address})."
+                )
+                self.adapter = PrologixAdapter(
+                    visa_resource, gpib_address, gpib_read_timeout=3000
+                )
+                self.adapter.connection.timeout = 20000  # ms
+                # Make absolutely sure the Prologix is configured correctly
+                self.adapter.write("++mode 1")  # controller
+                self.adapter.write("++auto 0")  # explicit reads
+                self.adapter.write("++eoi 1")  # assert EOI with last byte
+            else:
+                log.info(f"Connecting via VISA resource {resource}.")
+                self.adapter = VISAAdapter(resource)
+                self.adapter.connection.timeout = 10000  # ms
+
+            self.sourcemeter = Keithley2400(self.adapter)
+            model = self._detect_model()
+            if model == "2450":
+                self._configure_2450_compat()
+            self.Sourcemeter_type = model or (
+                "Prologix" if _looks_like_serial_resource(resource) else "VISA"
+            )
+            log.info(f"Connected to instrument type: {self.Sourcemeter_type}")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to connect to {resource}: {exc}") from exc
+
     def startup(self):
         log.info("Setting up instrument")
         # prepare data buffers for plotting later
         self.jv_data = []  # will hold (voltage, current) tuples
         self.jt_data = []  # will hold (time, current) tuples
         self.Sourcemeter_type = None
-        if test:
-            self.sourcemeter = DummyKeithley2400()  # Dummy instrument
-            self.Connected = True
-            self.Sourcemeter_type = "Dummy"
-            log.info("Connected to instrument.")
-        else:
-            try:
-                self.adapter = PrologixAdapter(
-                    "ASRL4::INSTR", 5, gpib_read_timeout=3000
-                )
-                self.adapter.connection.timeout = 20000  # ms
-                # Make absolutely sure the prologix is configured correctly
-                self.adapter.write("++mode 1")  # controller
-                self.adapter.write("++auto 0")  # *crucial* – we will read explicitly
-                self.adapter.write("++eoi 1")  # assert EOI with last byte
-                # self.adapter.write('++read_tmo_ms 5000')
-                self.sourcemeter = Keithley2400(self.adapter)
-                self.Sourcemeter_type = "6430"
-                log.info("Connected to Prologix adapter.")
-            except Exception:
-                log.info(
-                    "No Prologix adapter found (no 6400 here), trying VISA adapter, maybe the 2450 is connected?."
-                )
-            if self.Sourcemeter_type is None:
-                try:
-                    # Attempt to use VISA adapter if available
-                    self.adapter = VISAAdapter("USB0::0x05E6::0x2450::04491080::INSTR")
-
-                    self.adapter.connection.timeout = 10000  # ms
-                    self.sourcemeter = Keithley2400(self.adapter)
-                    self.sourcemeter.write("SYST:LANG SCPI")
-                    self.sourcemeter.write("SYST:CONS 2400")
-                    self.Sourcemeter_type = "2450"
-                    log.info("Connected to VISA adapter.")
-                except Exception:
-                    log.info("No sourcemeter found, is one plugged in?")
-                    # If no instrument is found, raise an error
-                    raise RuntimeError(
-                        "No instrument found. Please check the connection."
-                    )
+        self._connect_instrument()
         self.sourcemeter.reset()
         if self.max_speed:
             # Pull out all the stops to maximize the speed
@@ -541,7 +631,14 @@ class MainWindow(ManagedDockWindow):
         self.directory = r"Output"
 
         self.filename = r"{Identifier}_{Measurement mode}_{date}"
+        self.allow_dummy = ALLOW_DUMMY
+        self.device_selection = None
+        self.test_mode = bool(self.allow_dummy)
+        self._dummy_action = None
+        JVJTProcedure.device_selection = None
+        JVJTProcedure.test_mode = self.test_mode
         self._setup_menu()
+        self._update_device_status()
 
     def _setup_menu(self):
         # Get the menu bar provided by QMainWindow
@@ -557,6 +654,86 @@ class MainWindow(ManagedDockWindow):
         )  # Connect to the window's close method
         # Or connect directly to app quit: exit_action.triggered.connect(QtWidgets.QApplication.instance().quit)
         file_menu.addAction(exit_action)
+
+        device_menu = menu_bar.addMenu("&Device")
+        select_device = QtWidgets.QAction("Select Sourcemeter...", self)
+        select_device.triggered.connect(self._prompt_device_selection)
+        device_menu.addAction(select_device)
+
+        if self.allow_dummy:
+            self._dummy_action = QtWidgets.QAction("Use Dummy Sourcemeter", self)
+            self._dummy_action.setCheckable(True)
+            self._dummy_action.setChecked(self.test_mode)
+            self._dummy_action.toggled.connect(self._toggle_dummy_mode)
+            device_menu.addAction(self._dummy_action)
+        self._update_device_status()
+
+    def _update_device_status(self):
+        if self.test_mode:
+            status = "Dummy sourcemeter (test mode)"
+        elif not self.device_selection:
+            status = "No sourcemeter selected. Use Device -> Select Sourcemeter."
+        else:
+            status = f"Sourcemeter: {self.device_selection.get('resource')}"
+            gpib_val = self.device_selection.get("gpib")
+            if gpib_val is not None:
+                status += f" (GPIB {gpib_val})"
+        self.statusBar().showMessage(status)
+
+    def _switch_to_dummy_mode(self, *, notify=False, reason=None):
+        if not self.allow_dummy:
+            return
+        self.device_selection = None
+        self.test_mode = True
+        JVJTProcedure.device_selection = None
+        JVJTProcedure.test_mode = True
+        if self._dummy_action and not self._dummy_action.isChecked():
+            self._dummy_action.setChecked(True)
+        if notify and reason:
+            QtWidgets.QMessageBox.information(self, "Dummy mode", reason)
+        self._update_device_status()
+
+    def _toggle_dummy_mode(self, checked):
+        if not self.allow_dummy:
+            return
+        if checked:
+            self._switch_to_dummy_mode()
+            return
+        # User unchecked dummy mode – prompt for a real device
+        self.test_mode = False
+        JVJTProcedure.test_mode = False
+        self._prompt_device_selection()
+
+    def _prompt_device_selection(self):
+        dialog = DevicePicker(
+            self,
+            title="Select sourcemeter",
+            show_gpib=True,
+            default_gpib=DEFAULT_GPIB_ADDRESS,
+        )
+        if self.device_selection:
+            dialog.manual.setText(self.device_selection.get("resource", ""))
+            if self.device_selection.get("gpib") is not None:
+                dialog.gpib_spin.setValue(self.device_selection["gpib"])
+        result = _dialog_exec(dialog)
+        if result == QtWidgets.QDialog.Accepted:
+            resource, gpib = dialog.get()
+            if resource:
+                self.device_selection = {"resource": resource, "gpib": gpib}
+                JVJTProcedure.device_selection = self.device_selection
+                self.test_mode = False
+                JVJTProcedure.test_mode = False
+                if self._dummy_action and self._dummy_action.isChecked():
+                    self._dummy_action.setChecked(False)
+                desc = resource if gpib is None else f"{resource} (GPIB {gpib})"
+                log.info(f"Selected sourcemeter resource: {desc}")
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "No device selected",
+                    "Select a VISA resource or cancel to keep current settings.",
+                )
+        self._update_device_status()
 
 
 if __name__ == "__main__":
