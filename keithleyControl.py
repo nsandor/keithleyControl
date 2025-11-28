@@ -104,6 +104,7 @@ def resource_path(relative_path):
 
 class JVJTProcedure(Procedure):
     device_selection = None
+    preconnected = None
     test_mode = ALLOW_DUMMY
     measurement_mode = ListParameter(
         "Measurement mode",
@@ -219,6 +220,19 @@ class JVJTProcedure(Procedure):
         return None
 
     def _connect_instrument(self):
+        pre = getattr(JVJTProcedure, "preconnected", None)
+        if pre and pre.get("sourcemeter"):
+            self.sourcemeter = pre["sourcemeter"]
+            self.adapter = pre.get("adapter")
+            sel = pre.get("selection") or {}
+            if not getattr(self, "device_selection", None):
+                self.device_selection = sel
+            self.Sourcemeter_type = pre.get("model") or pre.get("type")
+            if not self.Sourcemeter_type and sel.get("resource"):
+                self.Sourcemeter_type = (
+                    "Prologix" if _looks_like_serial_resource(sel["resource"]) else "VISA"
+                )
+            return
         use_dummy = getattr(self, "test_mode", None)
         if use_dummy is None:
             use_dummy = JVJTProcedure.test_mode
@@ -633,10 +647,12 @@ class MainWindow(ManagedDockWindow):
         self.filename = r"{Identifier}_{Measurement mode}_{date}"
         self.allow_dummy = ALLOW_DUMMY
         self.device_selection = None
-        self.test_mode = bool(self.allow_dummy)
+        self.device_idn = None
+        self.test_mode = False
         self._dummy_action = None
         JVJTProcedure.device_selection = None
-        JVJTProcedure.test_mode = self.test_mode
+        JVJTProcedure.preconnected = None
+        JVJTProcedure.test_mode = False
         self._setup_menu()
         self._update_device_status()
 
@@ -678,14 +694,18 @@ class MainWindow(ManagedDockWindow):
             gpib_val = self.device_selection.get("gpib")
             if gpib_val is not None:
                 status += f" (GPIB {gpib_val})"
+            if self.device_idn:
+                status += f" [{self.device_idn}]"
         self.statusBar().showMessage(status)
 
     def _switch_to_dummy_mode(self, *, notify=False, reason=None):
         if not self.allow_dummy:
             return
         self.device_selection = None
+        self.device_idn = None
         self.test_mode = True
         JVJTProcedure.device_selection = None
+        JVJTProcedure.preconnected = None
         JVJTProcedure.test_mode = True
         if self._dummy_action and not self._dummy_action.isChecked():
             self._dummy_action.setChecked(True)
@@ -719,20 +739,102 @@ class MainWindow(ManagedDockWindow):
         if result == QtWidgets.QDialog.Accepted:
             resource, gpib = dialog.get()
             if resource:
-                self.device_selection = {"resource": resource, "gpib": gpib}
-                JVJTProcedure.device_selection = self.device_selection
-                self.test_mode = False
-                JVJTProcedure.test_mode = False
-                if self._dummy_action and self._dummy_action.isChecked():
-                    self._dummy_action.setChecked(False)
-                desc = resource if gpib is None else f"{resource} (GPIB {gpib})"
-                log.info(f"Selected sourcemeter resource: {desc}")
+                self._connect_selected_device(resource, gpib)
             else:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "No device selected",
                     "Select a VISA resource or cancel to keep current settings.",
                 )
+        self._update_device_status()
+
+    def _connect_selected_device(self, resource, gpib):
+        """Connect immediately when the picker is used and announce the ID."""
+        self.device_selection = {"resource": resource, "gpib": gpib}
+        self.device_idn = None
+        self.test_mode = False
+        JVJTProcedure.device_selection = self.device_selection
+        JVJTProcedure.test_mode = False
+        prev = JVJTProcedure.preconnected
+        if prev and prev.get("adapter"):
+            try:
+                prev["adapter"].close()
+            except Exception:
+                pass
+        JVJTProcedure.preconnected = None
+        if self._dummy_action and self._dummy_action.isChecked():
+            self._dummy_action.setChecked(False)
+
+        adapter = None
+        sourcemeter = None
+        ident = "Unknown"
+        model = None
+        try:
+            if resource.upper().startswith(("USB", "GPIB", "TCPIP")):
+                adapter = VISAAdapter(resource)
+                adapter.connection.timeout = 10000
+            else:
+                visa_resource = _normalize_serial_resource(resource)
+                adapter = PrologixAdapter(
+                    visa_resource, gpib or DEFAULT_GPIB_ADDRESS, gpib_read_timeout=3000
+                )
+                adapter.connection.timeout = 20000
+                adapter.write("++mode 1")
+                adapter.write("++auto 0")
+                adapter.write("++eoi 1")
+
+            sourcemeter = Keithley2400(adapter)
+            # Basic setup/zero similar to the provided snippet
+            sourcemeter.reset()
+            try:
+                ident = sourcemeter.ask("*IDN?") or ident
+            except Exception:
+                pass
+            if "2450" in ident:
+                try:
+                    sourcemeter.write("SYST:LANG SCPI")
+                    sourcemeter.write("SYST:CONS 2400")
+                except Exception:
+                    pass
+            sourcemeter.apply_voltage()
+            sourcemeter.source_voltage_range = 100
+            sourcemeter.source_voltage = 0
+            sourcemeter.enable_source()
+            sourcemeter.measure_current(nplc=1, current=0.105, auto_range=False)
+            sourcemeter.current_range = 0.001
+            sourcemeter.disable_source()
+            model = None
+            for candidate in ("2450", "2400", "6430"):
+                if candidate in ident:
+                    model = candidate
+                    break
+
+            self.device_idn = ident.strip()
+            JVJTProcedure.preconnected = {
+                "sourcemeter": sourcemeter,
+                "adapter": adapter,
+                "model": model,
+                "selection": self.device_selection,
+            }
+            log.info("Connected sourcemeter: %s", self.device_idn)
+            QtWidgets.QMessageBox.information(
+                self,
+                "Sourcemeter",
+                f"Connected: {ident}\nOutput zeroed and disabled.",
+            )
+        except Exception as exc:
+            JVJTProcedure.preconnected = None
+            self.device_selection = None
+            JVJTProcedure.device_selection = None
+            self.device_idn = None
+            if adapter:
+                try:
+                    adapter.close()
+                except Exception:
+                    pass
+            QtWidgets.QMessageBox.critical(
+                self, "Sourcemeter", f"Failed to connect: {exc}"
+            )
         self._update_device_status()
 
 
