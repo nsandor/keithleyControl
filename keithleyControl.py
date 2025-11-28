@@ -445,7 +445,7 @@ class JVJTProcedure(Procedure):
                 log.info(f"Measured current: {current:.4e} A")
                 elapsed_time = time.time() - experiment_start_time
                 data = {
-                    "Current JV (A)": 1,
+                    "Current JV (A)": current,
                     "Voltage JV (V)": voltage,
                     "Time JV (S)": elapsed_time,
                     "Current JT (A)": np.nan,  # Use NaN for columns not relevant to this mode
